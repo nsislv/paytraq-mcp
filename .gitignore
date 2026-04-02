@@ -1,0 +1,9 @@
+# .gitignore for Paytraq MCP
+venv/
+__pycache__/
+*.pyc
+.env
+.config/
+logs/
+*.sqlite
+.DS_Store
