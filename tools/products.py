@@ -1,17 +1,37 @@
 """
 PayTraq MCP — Products, Services & Inventory Tools
 ----------------------------------------------------
-Инструменты для работы с:
-- Товарами и услугами (CRUD, ценообразование)
-- Складами и зонами загрузки
-- Инвентарём и остатками
-- Перевозчиками (shippers)
-- Лотами/партиями товаров
+Tools for managing:
+- Products (physical goods): create, update, price, track inventory
+- Services (non-physical): create and update service items
+- Warehouses: list locations and check stock levels
+- Lots/batches: track product batches with expiry dates
+- Shippers: manage delivery carrier records
+
+When to use these tools:
+  - list_products / get_product: find product IDs before adding to an invoice
+  - create_product / update_product: manage the product catalogue
+  - get_current_inventory: check stock levels at a warehouse
+  - get_product_inventory: see how many units of a product are across all warehouses
+  - list_services / create_service: manage billable service items
 """
 
-from typing import Optional
+import re
+from typing import Annotated, Optional
+from pydantic import Field
 from mcp.server.fastmcp import FastMCP
 from paytraq_client import get, post, format_response
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+VALID_PRODUCT_TYPES = {1: "storable", 2: "consumable", 3: "fixed_asset"}
+VALID_PRODUCT_STATUSES = {1: "active", 2: "discontinued"}
+
+
+def _validate_date(value: Optional[str], field_name: str) -> Optional[str]:
+    if value and not _DATE_RE.match(value):
+        return f"Invalid {field_name} format '{value}'. Use YYYY-MM-DD (e.g. 2026-06-30)."
+    return None
 
 
 def register(mcp: FastMCP) -> None:
@@ -20,348 +40,612 @@ def register(mcp: FastMCP) -> None:
 
     @mcp.tool()
     def list_products(
-        query: Optional[str] = None,
-        page: int = 0,
+        query: Annotated[Optional[str], Field(
+            default=None,
+            description="Search by product name, SKU/code, or barcode.",
+        )] = None,
+        page: Annotated[int, Field(
+            default=0,
+            ge=0,
+            description="Page number for pagination (100 records per page).",
+        )] = 0,
     ) -> str:
         """
-        Получить список товаров.
+        List products (physical goods) in the PayTraq catalogue.
 
-        Args:
-            query: Поиск по названию, артикулу (SKU) или штрихкоду
-            page:  Страница (100 записей, по умолчанию 0)
+        Use this tool when you need to:
+        - Find a product's ItemID before adding it to an invoice or purchase order
+        - Browse the full product catalogue
+        - Search for a product by name, SKU, or barcode
         """
-        params: dict = {"page": page}
-        if query: params["query"] = query
-        return format_response(get("products", params))
+        try:
+            params: dict = {"page": page}
+            if query: params["query"] = query
+            return format_response(get("products", params))
+        except Exception as e:
+            raise
 
     @mcp.tool()
-    def get_product(item_id: int) -> str:
+    def get_product(
+        item_id: Annotated[int, Field(
+            description="Numeric PayTraq product (item) ID.",
+            gt=0,
+        )],
+    ) -> str:
         """
-        Получить детальную информацию о товаре по ID.
+        Get full details of a product by its ID.
 
-        Args:
-            item_id: ID товара
+        Use this tool to retrieve pricing, unit of measure, tax key, stock type,
+        and description for a specific product.
         """
-        return format_response(get(f"product/{item_id}"))
+        try:
+            return format_response(get(f"product/{item_id}"))
+        except Exception as e:
+            raise
 
     @mcp.tool()
     def create_product(
-        name: str,
-        code: Optional[str] = None,
-        barcode: Optional[str] = None,
-        unit: Optional[str] = None,
-        product_type: int = 1,
-        purchase_price: Optional[float] = None,
-        sale_price: Optional[float] = None,
-        tax_key: Optional[str] = None,
-        description: Optional[str] = None,
-        comment: Optional[str] = None,
+        name: Annotated[str, Field(description="Product name as it appears on invoices.")],
+        code: Annotated[Optional[str], Field(
+            default=None,
+            description="SKU or internal article code.",
+        )] = None,
+        barcode: Annotated[Optional[str], Field(
+            default=None,
+            description="Product barcode (EAN, UPC, etc.).",
+        )] = None,
+        unit: Annotated[Optional[str], Field(
+            default=None,
+            description="Unit of measure (e.g. 'pcs', 'kg', 'l', 'm', 'box').",
+        )] = None,
+        product_type: Annotated[int, Field(
+            default=1,
+            description=(
+                "Product type: 1 = Storable (tracked inventory), "
+                "2 = Consumable (expensed on purchase), "
+                "3 = Fixed Asset (depreciated)."
+            ),
+            ge=1,
+            le=3,
+        )] = 1,
+        purchase_price: Annotated[Optional[float], Field(
+            default=None,
+            description="Default purchase/cost price. Dot as decimal separator.",
+            ge=0,
+        )] = None,
+        sale_price: Annotated[Optional[float], Field(
+            default=None,
+            description="Default sale price. Dot as decimal separator.",
+            ge=0,
+        )] = None,
+        tax_key: Annotated[Optional[str], Field(
+            default=None,
+            description=(
+                "Tax key code for VAT calculation. "
+                "Use list_tax_keys to see available keys."
+            ),
+        )] = None,
+        description: Annotated[Optional[str], Field(
+            default=None,
+            description="Product description shown on documents.",
+        )] = None,
+        comment: Annotated[Optional[str], Field(
+            default=None,
+            description="Internal notes (not printed on documents).",
+        )] = None,
     ) -> str:
         """
-        Создать новый товар.
+        Create a new product in the PayTraq catalogue.
 
-        Args:
-            name:           Название товара (обязательно)
-            code:           Артикул/SKU
-            barcode:        Штрихкод
-            unit:           Единица измерения (pcs, kg, l и т.д.)
-            product_type:   Тип: 1=Складируемый, 2=Расходный, 3=Основное средство
-            purchase_price: Закупочная цена
-            sale_price:     Цена продажи
-            tax_key:        Налоговый ключ
-            description:    Описание
-            comment:        Комментарий
+        Use this tool when adding a new physical product that will appear on
+        invoices or purchase orders. For non-physical billable items, use
+        create_service instead.
         """
-        data: dict = {"Name": name, "Type": product_type}
-        if code:            data["Code"] = code
-        if barcode:         data["BarCode"] = barcode
-        if unit:            data["Unit"] = unit
-        if purchase_price is not None: data["PurchasePrice"] = purchase_price
-        if sale_price is not None:     data["SalePrice"] = sale_price
-        if tax_key:         data["TaxKey"] = tax_key
-        if description:     data["Description"] = description
-        if comment:         data["Comment"] = comment
-        return format_response(post("product", data, "Product"))
+        try:
+            if product_type not in VALID_PRODUCT_TYPES:
+                return (
+                    f"Error: Invalid product_type {product_type}. "
+                    f"Valid values: 1 (storable), 2 (consumable), 3 (fixed asset)."
+                )
+            data: dict = {"Name": name, "Type": product_type}
+            if code:            data["Code"] = code
+            if barcode:         data["BarCode"] = barcode
+            if unit:            data["Unit"] = unit
+            if purchase_price is not None: data["PurchasePrice"] = purchase_price
+            if sale_price is not None:     data["SalePrice"] = sale_price
+            if tax_key:         data["TaxKey"] = tax_key
+            if description:     data["Description"] = description
+            if comment:         data["Comment"] = comment
+            return format_response(post("product", data, "Product"))
+        except Exception as e:
+            raise
 
     @mcp.tool()
     def update_product(
-        item_id: int,
-        name: Optional[str] = None,
-        code: Optional[str] = None,
-        barcode: Optional[str] = None,
-        unit: Optional[str] = None,
-        purchase_price: Optional[float] = None,
-        sale_price: Optional[float] = None,
-        tax_key: Optional[str] = None,
-        description: Optional[str] = None,
-        status: Optional[int] = None,
+        item_id: Annotated[int, Field(
+            description="ID of the product to update.",
+            gt=0,
+        )],
+        name: Annotated[Optional[str], Field(
+            default=None,
+            description="New product name.",
+        )] = None,
+        code: Annotated[Optional[str], Field(
+            default=None,
+            description="New SKU or article code.",
+        )] = None,
+        barcode: Annotated[Optional[str], Field(
+            default=None,
+            description="New barcode.",
+        )] = None,
+        unit: Annotated[Optional[str], Field(
+            default=None,
+            description="New unit of measure.",
+        )] = None,
+        purchase_price: Annotated[Optional[float], Field(
+            default=None,
+            description="New purchase/cost price.",
+            ge=0,
+        )] = None,
+        sale_price: Annotated[Optional[float], Field(
+            default=None,
+            description="New sale price.",
+            ge=0,
+        )] = None,
+        tax_key: Annotated[Optional[str], Field(
+            default=None,
+            description="New tax key. Use list_tax_keys to see options.",
+        )] = None,
+        description: Annotated[Optional[str], Field(
+            default=None,
+            description="New product description.",
+        )] = None,
+        status: Annotated[Optional[int], Field(
+            default=None,
+            description="Product status: 1 = Active, 2 = Discontinued.",
+            ge=1,
+            le=2,
+        )] = None,
     ) -> str:
         """
-        Обновить данные товара.
+        Update fields on an existing product record.
 
-        Args:
-            item_id:        ID товара (обязательно)
-            name:           Новое название
-            code:           Артикул/SKU
-            barcode:        Штрихкод
-            unit:           Единица измерения
-            purchase_price: Закупочная цена
-            sale_price:     Цена продажи
-            tax_key:        Налоговый ключ
-            description:    Описание
-            status:         Статус: 1=Активный, 2=Снят с производства
+        Use this tool when a product's price, description, or status changes.
+        Only the fields you provide will be updated.
         """
-        data: dict = {}
-        if name:            data["Name"] = name
-        if code:            data["Code"] = code
-        if barcode:         data["BarCode"] = barcode
-        if unit:            data["Unit"] = unit
-        if purchase_price is not None: data["PurchasePrice"] = purchase_price
-        if sale_price is not None:     data["SalePrice"] = sale_price
-        if tax_key:         data["TaxKey"] = tax_key
-        if description:     data["Description"] = description
-        if status is not None: data["Status"] = status
-        if not data:
-            return "❌ Error: Provide at least one field to update."
-        return format_response(post(f"product/{item_id}", data, "Product"))
+        try:
+            if status is not None and status not in VALID_PRODUCT_STATUSES:
+                return (
+                    f"Error: Invalid status {status}. "
+                    f"Valid values: 1 (active), 2 (discontinued)."
+                )
+            data: dict = {}
+            if name:            data["Name"] = name
+            if code:            data["Code"] = code
+            if barcode:         data["BarCode"] = barcode
+            if unit:            data["Unit"] = unit
+            if purchase_price is not None: data["PurchasePrice"] = purchase_price
+            if sale_price is not None:     data["SalePrice"] = sale_price
+            if tax_key:         data["TaxKey"] = tax_key
+            if description:     data["Description"] = description
+            if status is not None: data["Status"] = status
+            if not data:
+                return "Error: Provide at least one field to update."
+            return format_response(post(f"product/{item_id}", data, "Product"))
+        except Exception as e:
+            raise
 
     @mcp.tool()
-    def get_product_price_list(price_group_id: int) -> str:
+    def get_product_price_list(
+        price_group_id: Annotated[int, Field(
+            description="Price group ID. Use list_client_groups or ask the user for it.",
+            gt=0,
+        )],
+    ) -> str:
         """
-        Получить прайс-лист товаров по группе цен.
+        Get the product price list for a specific price group.
 
-        Args:
-            price_group_id: ID ценовой группы
+        Use this tool when a customer has a special pricing agreement and you need
+        to see what prices apply to them (e.g. wholesale vs retail).
         """
-        return format_response(get(f"productPriceList/{price_group_id}"))
+        try:
+            return format_response(get(f"productPriceList/{price_group_id}"))
+        except Exception as e:
+            raise
 
     @mcp.tool()
     def set_product_price(
-        item_id: int,
-        price: float,
-        price_group_id: Optional[int] = None,
-        currency: Optional[str] = None,
+        item_id: Annotated[int, Field(
+            description="Product ID to set a price for.",
+            gt=0,
+        )],
+        price: Annotated[float, Field(
+            description="New price. Dot as decimal separator (e.g. 29.99).",
+            ge=0,
+        )],
+        price_group_id: Annotated[Optional[int], Field(
+            default=None,
+            description="Price group ID. If omitted, updates the standard/default price.",
+            gt=0,
+        )] = None,
+        currency: Annotated[Optional[str], Field(
+            default=None,
+            description="ISO 4217 currency code for this price (e.g. EUR, USD).",
+        )] = None,
     ) -> str:
         """
-        Установить цену товара.
+        Set or update the price of a product, optionally for a specific price group.
 
-        Args:
-            item_id:        ID товара
-            price:          Цена
-            price_group_id: ID ценовой группы (если не указан — стандартная)
-            currency:       Валюта (EUR, USD и т.д.)
+        Use this tool when changing a product's sale price, or setting a
+        special price for a customer group (e.g. wholesale, VIP).
         """
-        data: dict = {"Price": price}
-        if price_group_id: data["PriceGroupID"] = price_group_id
-        if currency:       data["Currency"] = currency
-        return format_response(post(f"productPrice/{item_id}", data, "Price"))
+        try:
+            data: dict = {"Price": price}
+            if price_group_id: data["PriceGroupID"] = price_group_id
+            if currency:       data["Currency"] = currency.upper()
+            return format_response(post(f"productPrice/{item_id}", data, "Price"))
+        except Exception as e:
+            raise
 
     @mcp.tool()
     def list_product_groups() -> str:
-        """Получить список групп товаров."""
-        return format_response(get("productGroups"))
+        """
+        List all product groups (categories) in PayTraq.
+
+        Use this tool to get group IDs when organizing products or filtering
+        the product catalogue by category.
+        """
+        try:
+            return format_response(get("productGroups"))
+        except Exception as e:
+            raise
 
     @mcp.tool()
     def list_lots(
-        item_id: Optional[int] = None,
-        page: int = 0,
+        item_id: Annotated[Optional[int], Field(
+            default=None,
+            description="Filter lots by product ID. Leave empty to list all lots.",
+            gt=0,
+        )] = None,
+        page: Annotated[int, Field(
+            default=0,
+            ge=0,
+            description="Page number (100 records per page).",
+        )] = 0,
     ) -> str:
         """
-        Получить список лотов/партий товаров.
+        List product lots/batches, optionally filtered by product.
 
-        Args:
-            item_id: Фильтр по ID товара (необязательно)
-            page:    Страница (по умолчанию 0)
+        Use this tool when tracking batch numbers or expiry dates for
+        perishable goods, pharmaceuticals, or serialised inventory.
         """
-        params: dict = {"page": page}
-        if item_id: params["item_id"] = item_id
-        return format_response(get("lots", params))
+        try:
+            params: dict = {"page": page}
+            if item_id: params["item_id"] = item_id
+            return format_response(get("lots", params))
+        except Exception as e:
+            raise
 
     @mcp.tool()
     def add_product_lot(
-        item_id: int,
-        lot_number: str,
-        expiry_date: Optional[str] = None,
-        quantity: Optional[float] = None,
-        comment: Optional[str] = None,
+        item_id: Annotated[int, Field(
+            description="Product ID to assign this lot to.",
+            gt=0,
+        )],
+        lot_number: Annotated[str, Field(
+            description="Batch or lot number (e.g. 'LOT-2026-001').",
+        )],
+        expiry_date: Annotated[Optional[str], Field(
+            default=None,
+            description="Expiry/best-before date in YYYY-MM-DD format.",
+        )] = None,
+        quantity: Annotated[Optional[float], Field(
+            default=None,
+            description="Initial quantity in this lot.",
+            ge=0,
+        )] = None,
+        comment: Annotated[Optional[str], Field(
+            default=None,
+            description="Notes about this lot (e.g. supplier batch info).",
+        )] = None,
     ) -> str:
         """
-        Добавить лот/партию товара.
+        Add a new lot/batch to a product for batch tracking.
 
-        Args:
-            item_id:     ID товара (обязательно)
-            lot_number:  Номер лота/партии (обязательно)
-            expiry_date: Дата истечения срока YYYY-MM-DD
-            quantity:    Количество
-            comment:     Комментарий
+        Use this tool when receiving goods that require lot or batch number
+        tracking (e.g. food products, chemicals, medical supplies).
         """
-        data: dict = {"LotNumber": lot_number}
-        if expiry_date: data["ExpiryDate"] = expiry_date
-        if quantity is not None: data["Qty"] = quantity
-        if comment:     data["Comment"] = comment
-        return format_response(post(f"product/lot/{item_id}", data, "Lot"))
+        try:
+            err = _validate_date(expiry_date, "expiry_date")
+            if err:
+                return f"Error: {err}"
+            data: dict = {"LotNumber": lot_number}
+            if expiry_date: data["ExpiryDate"] = expiry_date
+            if quantity is not None: data["Qty"] = quantity
+            if comment:     data["Comment"] = comment
+            return format_response(post(f"product/lot/{item_id}", data, "Lot"))
+        except Exception as e:
+            raise
 
     # ── SERVICES ──────────────────────────────────────────────────────────────
 
     @mcp.tool()
     def list_services(
-        query: Optional[str] = None,
-        page: int = 0,
+        query: Annotated[Optional[str], Field(
+            default=None,
+            description="Search by service name or code.",
+        )] = None,
+        page: Annotated[int, Field(
+            default=0,
+            ge=0,
+            description="Page number (100 records per page).",
+        )] = 0,
     ) -> str:
         """
-        Получить список услуг.
+        List service items in the PayTraq catalogue.
 
-        Args:
-            query: Поиск по названию
-            page:  Страница (по умолчанию 0)
+        Use this tool when you need to find a service ID before adding it to
+        an invoice. Services are non-physical billable items (consulting, shipping, etc.).
         """
-        params: dict = {"page": page}
-        if query: params["query"] = query
-        return format_response(get("services", params))
+        try:
+            params: dict = {"page": page}
+            if query: params["query"] = query
+            return format_response(get("services", params))
+        except Exception as e:
+            raise
 
     @mcp.tool()
-    def get_service(item_id: int) -> str:
+    def get_service(
+        item_id: Annotated[int, Field(
+            description="Numeric PayTraq service item ID.",
+            gt=0,
+        )],
+    ) -> str:
         """
-        Получить детальную информацию об услуге по ID.
+        Get full details of a service item by ID.
 
-        Args:
-            item_id: ID услуги
+        Use this tool to retrieve pricing, tax key, and description for
+        a specific service.
         """
-        return format_response(get(f"service/{item_id}"))
+        try:
+            return format_response(get(f"service/{item_id}"))
+        except Exception as e:
+            raise
 
     @mcp.tool()
     def create_service(
-        name: str,
-        code: Optional[str] = None,
-        unit: Optional[str] = None,
-        sale_price: Optional[float] = None,
-        tax_key: Optional[str] = None,
-        description: Optional[str] = None,
+        name: Annotated[str, Field(description="Service name as it appears on invoices.")],
+        code: Annotated[Optional[str], Field(
+            default=None,
+            description="Internal service code or SKU.",
+        )] = None,
+        unit: Annotated[Optional[str], Field(
+            default=None,
+            description="Billing unit (e.g. 'hour', 'day', 'project', 'month').",
+        )] = None,
+        sale_price: Annotated[Optional[float], Field(
+            default=None,
+            description="Default price per unit. Dot as decimal separator.",
+            ge=0,
+        )] = None,
+        tax_key: Annotated[Optional[str], Field(
+            default=None,
+            description="Tax key for VAT. Use list_tax_keys to see available keys.",
+        )] = None,
+        description: Annotated[Optional[str], Field(
+            default=None,
+            description="Service description printed on invoice line items.",
+        )] = None,
     ) -> str:
         """
-        Создать новую услугу.
+        Create a new service item in the PayTraq catalogue.
 
-        Args:
-            name:       Название услуги (обязательно)
-            code:       Код/артикул
-            unit:       Единица измерения
-            sale_price: Цена продажи
-            tax_key:    Налоговый ключ
-            description: Описание
+        Use this tool when adding a new billable service (consulting, support,
+        delivery, etc.) that will appear on sales invoices.
         """
-        data: dict = {"Name": name}
-        if code:        data["Code"] = code
-        if unit:        data["Unit"] = unit
-        if sale_price is not None: data["SalePrice"] = sale_price
-        if tax_key:     data["TaxKey"] = tax_key
-        if description: data["Description"] = description
-        return format_response(post("service", data, "Service"))
+        try:
+            data: dict = {"Name": name}
+            if code:        data["Code"] = code
+            if unit:        data["Unit"] = unit
+            if sale_price is not None: data["SalePrice"] = sale_price
+            if tax_key:     data["TaxKey"] = tax_key
+            if description: data["Description"] = description
+            return format_response(post("service", data, "Service"))
+        except Exception as e:
+            raise
 
     @mcp.tool()
     def update_service(
-        item_id: int,
-        name: Optional[str] = None,
-        code: Optional[str] = None,
-        sale_price: Optional[float] = None,
-        tax_key: Optional[str] = None,
-        description: Optional[str] = None,
+        item_id: Annotated[int, Field(
+            description="ID of the service to update.",
+            gt=0,
+        )],
+        name: Annotated[Optional[str], Field(
+            default=None,
+            description="New service name.",
+        )] = None,
+        code: Annotated[Optional[str], Field(
+            default=None,
+            description="New service code.",
+        )] = None,
+        sale_price: Annotated[Optional[float], Field(
+            default=None,
+            description="New sale price.",
+            ge=0,
+        )] = None,
+        tax_key: Annotated[Optional[str], Field(
+            default=None,
+            description="New tax key.",
+        )] = None,
+        description: Annotated[Optional[str], Field(
+            default=None,
+            description="New service description.",
+        )] = None,
     ) -> str:
         """
-        Обновить данные услуги.
+        Update fields on an existing service item.
 
-        Args:
-            item_id:     ID услуги (обязательно)
-            name:        Новое название
-            code:        Код/артикул
-            sale_price:  Цена продажи
-            tax_key:     Налоговый ключ
-            description: Описание
+        Use this tool when a service price or description changes.
+        Only provided fields are updated.
         """
-        data: dict = {}
-        if name:        data["Name"] = name
-        if code:        data["Code"] = code
-        if sale_price is not None: data["SalePrice"] = sale_price
-        if tax_key:     data["TaxKey"] = tax_key
-        if description: data["Description"] = description
-        if not data:
-            return "❌ Error: Provide at least one field to update."
-        return format_response(post(f"service/{item_id}", data, "Service"))
+        try:
+            data: dict = {}
+            if name:        data["Name"] = name
+            if code:        data["Code"] = code
+            if sale_price is not None: data["SalePrice"] = sale_price
+            if tax_key:     data["TaxKey"] = tax_key
+            if description: data["Description"] = description
+            if not data:
+                return "Error: Provide at least one field to update."
+            return format_response(post(f"service/{item_id}", data, "Service"))
+        except Exception as e:
+            raise
 
     @mcp.tool()
     def list_service_groups() -> str:
-        """Получить список групп услуг."""
-        return format_response(get("serviceGroups"))
+        """
+        List all service groups (categories) in PayTraq.
+
+        Use this tool to get group IDs for filtering services or assigning
+        a new service to an existing category.
+        """
+        try:
+            return format_response(get("serviceGroups"))
+        except Exception as e:
+            raise
 
     # ── WAREHOUSES & INVENTORY ────────────────────────────────────────────────
 
     @mcp.tool()
     def list_warehouses() -> str:
-        """Получить список складов."""
-        return format_response(get("warehouses"))
+        """
+        List all warehouses configured in PayTraq.
+
+        Use this tool to find warehouse IDs before checking inventory levels
+        or creating stock movements.
+        """
+        try:
+            return format_response(get("warehouses"))
+        except Exception as e:
+            raise
 
     @mcp.tool()
-    def get_warehouse(warehouse_id: int) -> str:
+    def get_warehouse(
+        warehouse_id: Annotated[int, Field(
+            description="Numeric PayTraq warehouse ID.",
+            gt=0,
+        )],
+    ) -> str:
         """
-        Получить информацию о складе по ID.
+        Get details of a specific warehouse (name, address, loading areas).
 
-        Args:
-            warehouse_id: ID склада
+        Use this tool when you need the full configuration of a warehouse location.
         """
-        return format_response(get(f"warehouse/{warehouse_id}"))
-
-    @mcp.tool()
-    def get_current_inventory(warehouse_id: int) -> str:
-        """
-        Получить текущие остатки на складе.
-
-        Args:
-            warehouse_id: ID склада
-        """
-        return format_response(get(f"currentInventory/{warehouse_id}"))
+        try:
+            return format_response(get(f"warehouse/{warehouse_id}"))
+        except Exception as e:
+            raise
 
     @mcp.tool()
-    def get_product_inventory(item_id: int) -> str:
+    def get_current_inventory(
+        warehouse_id: Annotated[int, Field(
+            description="Warehouse ID to check current stock levels at.",
+            gt=0,
+        )],
+    ) -> str:
         """
-        Получить остатки конкретного товара по всем складам.
+        Get current stock levels for all products at a specific warehouse.
 
-        Args:
-            item_id: ID товара
+        Use this tool when you need to know:
+        - What is in stock at a given location
+        - Whether there is enough inventory to fulfil an order
+        - Overall warehouse stock report
         """
-        return format_response(get(f"productInventory/{item_id}"))
+        try:
+            return format_response(get(f"currentInventory/{warehouse_id}"))
+        except Exception as e:
+            raise
+
+    @mcp.tool()
+    def get_product_inventory(
+        item_id: Annotated[int, Field(
+            description="Product ID to check inventory across all warehouses.",
+            gt=0,
+        )],
+    ) -> str:
+        """
+        Get stock levels for a specific product across all warehouses.
+
+        Use this tool when you need to know the total available quantity of a
+        product and where it is physically located.
+        """
+        try:
+            return format_response(get(f"productInventory/{item_id}"))
+        except Exception as e:
+            raise
 
     @mcp.tool()
     def list_loading_areas() -> str:
-        """Получить список зон загрузки/отгрузки."""
-        return format_response(get("loadingAreas"))
+        """
+        List all loading/unloading areas defined in PayTraq.
+
+        Use this tool when configuring shipment routing or dispatch zones
+        in warehouse operations.
+        """
+        try:
+            return format_response(get("loadingAreas"))
+        except Exception as e:
+            raise
 
     @mcp.tool()
-    def list_shippers(page: int = 0) -> str:
+    def list_shippers(
+        page: Annotated[int, Field(
+            default=0,
+            ge=0,
+            description="Page number (100 records per page).",
+        )] = 0,
+    ) -> str:
         """
-        Получить список перевозчиков.
+        List all shipping carriers/shippers configured in PayTraq.
 
-        Args:
-            page: Страница (по умолчанию 0)
+        Use this tool to find shipper IDs when assigning a carrier to a
+        sales or delivery document.
         """
-        return format_response(get("shippers", {"page": page}))
+        try:
+            return format_response(get("shippers", {"page": page}))
+        except Exception as e:
+            raise
 
     @mcp.tool()
     def create_shipper(
-        name: str,
-        contact: Optional[str] = None,
-        phone: Optional[str] = None,
-        email: Optional[str] = None,
+        name: Annotated[str, Field(description="Carrier/shipping company name.")],
+        contact: Annotated[Optional[str], Field(
+            default=None,
+            description="Contact person at the carrier.",
+        )] = None,
+        phone: Annotated[Optional[str], Field(
+            default=None,
+            description="Carrier's phone number.",
+        )] = None,
+        email: Annotated[Optional[str], Field(
+            default=None,
+            description="Carrier's email address.",
+        )] = None,
     ) -> str:
         """
-        Добавить нового перевозчика.
+        Add a new shipping carrier (shipper) to PayTraq.
 
-        Args:
-            name:    Название перевозчика (обязательно)
-            contact: Контактное лицо
-            phone:   Телефон
-            email:   Email
+        Use this tool when you start working with a new delivery company and
+        need to register them for use on shipping documents.
         """
-        data: dict = {"ShipperName": name}
-        if contact: data["Contact"] = contact
-        if phone:   data["Phone"] = phone
-        if email:   data["Email"] = email
-        return format_response(post("shipper", data, "Shipper"))
+        try:
+            import re as _re
+            if email and not _re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+                return f"Error: Invalid email address '{email}'."
+            data: dict = {"ShipperName": name}
+            if contact: data["Contact"] = contact
+            if phone:   data["Phone"] = phone
+            if email:   data["Email"] = email
+            return format_response(post("shipper", data, "Shipper"))
+        except Exception as e:
+            raise

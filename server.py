@@ -57,12 +57,13 @@ mcp = FastMCP(
 
 # ── Регистрация инструментов ──────────────────────────────────────────────────
 
-from tools import clients, documents, products, accounting
+from tools import clients, documents, products, accounting, reports
 
 clients.register(mcp)
 documents.register(mcp)
 products.register(mcp)
 accounting.register(mcp)
+reports.register(mcp)
 
 # ── Запуск ────────────────────────────────────────────────────────────────────
 

@@ -13,7 +13,9 @@ import time
 import threading
 import xml.etree.ElementTree as ET
 from typing import Optional, Any
-from datetime import datetime
+from datetime import datetime, timezone
+
+UTC = timezone.utc
 
 import httpx
 
@@ -43,12 +45,12 @@ class RateLimiter:
         # Daily counter
         self.daily_count = 0
         self.daily_limit = 5000
-        self.daily_reset = datetime.utcnow().date()
+        self.daily_reset = datetime.now(UTC).date()
 
     def acquire(self) -> None:
         with self._lock:
             # Reset daily counter if new day
-            today = datetime.utcnow().date()
+            today = datetime.now(UTC).date()
             if today != self.daily_reset:
                 self.daily_count = 0
                 self.daily_reset = today
@@ -212,7 +214,7 @@ def format_response(data: dict, max_items: int = 50) -> str:
     import json
 
     if "error" in data:
-        return f"❌ Error: {data['error']}"
+        raise RuntimeError(data['error'])
 
     # Считаем элементы верхнего уровня
     def _count_items(d: Any, depth: int = 0) -> int:
@@ -228,7 +230,7 @@ def format_response(data: dict, max_items: int = 50) -> str:
         # Показываем только первые max_items
         data = _truncate(data, max_items)
         result = json.dumps(data, ensure_ascii=False, indent=2)
-        return f"{result}\n\n⚠️  Showing first {max_items} of {total} items. Use 'page' parameter for more."
+        return f"{result}\n\n⚠️  Results truncated: showing first {max_items} of {total} items. Pass page=1, page=2, ... to retrieve the next pages (100 records each)."
 
     return json.dumps(data, ensure_ascii=False, indent=2)
 
