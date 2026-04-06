@@ -1,11 +1,11 @@
 """
 PayTraq API Client
 ------------------
-Базовый HTTP клиент с:
+Base HTTP client with:
 - Rate limiting (1 req/sec avg, burst 5, max 5000/day)
-- Автоматическим XML-парсингом
-- Retry при 429/5xx ошибках
-- Централизованной обработкой ошибок
+- Automatic XML parsing
+- Retry on 429/5xx errors
+- Centralised error handling
 """
 
 import os
@@ -19,7 +19,7 @@ UTC = timezone.utc
 
 import httpx
 
-# ── Конфигурация ──────────────────────────────────────────────────────────────
+# ── Configuration ─────────────────────────────────────────────────────────────
 
 BASE_URL = "https://go.paytraq.com/api"
 
@@ -49,7 +49,7 @@ class RateLimiter:
 
     def acquire(self) -> None:
         with self._lock:
-            # Reset daily counter if new day
+            # Reset daily counter on new day
             today = datetime.now(UTC).date()
             if today != self.daily_reset:
                 self.daily_count = 0
@@ -68,7 +68,7 @@ class RateLimiter:
             self.tokens = min(self.burst, self.tokens + refill)
             self.last_refill = now
 
-            # Wait if no tokens
+            # Wait if no tokens available
             if self.tokens < 1:
                 wait = (1 - self.tokens) / self.rate
                 time.sleep(wait)
@@ -85,7 +85,7 @@ _limiter = RateLimiter()
 # ── XML Helpers ───────────────────────────────────────────────────────────────
 
 def xml_to_dict(element: ET.Element) -> Any:
-    """Рекурсивно конвертирует XML Element в dict/str."""
+    """Recursively converts an XML Element to a dict or str."""
     children = list(element)
     if not children:
         return element.text or ""
@@ -94,7 +94,7 @@ def xml_to_dict(element: ET.Element) -> Any:
     for child in children:
         value = xml_to_dict(child)
         if child.tag in result:
-            # Превращаем в список при дублирующихся тегах
+            # Convert to list on duplicate tags
             existing = result[child.tag]
             if not isinstance(existing, list):
                 result[child.tag] = [existing]
@@ -105,7 +105,7 @@ def xml_to_dict(element: ET.Element) -> Any:
 
 
 def parse_xml(text: str) -> dict:
-    """Парсит XML-ответ PayTraq в dict."""
+    """Parses a PayTraq XML response into a dict."""
     try:
         root = ET.fromstring(text)
         return {root.tag: xml_to_dict(root)}
@@ -114,7 +114,7 @@ def parse_xml(text: str) -> dict:
 
 
 def build_xml(tag: str, data: dict) -> str:
-    """Строит XML из dict для POST-запросов."""
+    """Builds an XML string from a dict for POST requests."""
     def _build(parent: ET.Element, d: dict) -> None:
         for key, val in d.items():
             child = ET.SubElement(parent, key)
@@ -138,8 +138,8 @@ def _request(
     retries: int = 3,
 ) -> dict:
     """
-    Выполняет HTTP-запрос к PayTraq API.
-    Автоматически добавляет auth-параметры и соблюдает rate limit.
+    Executes an HTTP request to the PayTraq API.
+    Automatically appends auth parameters and respects the rate limit.
     """
     if not API_TOKEN or not API_KEY:
         return {"error": "PAYTRAQ_API_TOKEN and PAYTRAQ_API_KEY must be set."}
@@ -162,7 +162,7 @@ def _request(
                     headers=headers,
                 )
 
-            # Обработка ошибок
+            # Error handling
             if response.status_code == 429:
                 wait = int(response.headers.get("Retry-After", 60))
                 time.sleep(wait)
@@ -208,15 +208,16 @@ def post(path: str, data: dict, root_tag: str, params: Optional[dict] = None) ->
 
 def format_response(data: dict, max_items: int = 50) -> str:
     """
-    Форматирует dict-ответ в читаемую строку для MCP-инструментов.
-    Ограничивает вывод при больших списках.
+    Formats a dict response into a readable string for MCP tools.
+    Raises RuntimeError on API errors so FastMCP returns isError:true.
+    Truncates large result sets and includes pagination guidance.
     """
     import json
 
     if "error" in data:
         raise RuntimeError(data['error'])
 
-    # Считаем элементы верхнего уровня
+    # Count top-level items
     def _count_items(d: Any, depth: int = 0) -> int:
         if isinstance(d, list):
             return len(d)
@@ -227,10 +228,14 @@ def format_response(data: dict, max_items: int = 50) -> str:
 
     total = _count_items(data)
     if total > max_items:
-        # Показываем только первые max_items
+        # Show only the first max_items
         data = _truncate(data, max_items)
         result = json.dumps(data, ensure_ascii=False, indent=2)
-        return f"{result}\n\n⚠️  Results truncated: showing first {max_items} of {total} items. Pass page=1, page=2, ... to retrieve the next pages (100 records each)."
+        return (
+            f"{result}\n\n"
+            f"⚠️  Results truncated: showing first {max_items} of {total} items. "
+            f"Pass page=1, page=2, ... to retrieve the next pages (100 records each)."
+        )
 
     return json.dumps(data, ensure_ascii=False, indent=2)
 

@@ -1,34 +1,35 @@
 # PayTraq MCP
 
-MCP (Model Context Protocol) serveris integrācijai ar [PayTraq](https://paytraq.com) — mākoņa grāmatvedības un ERP sistēmu. Ļauj Claude un citiem MCP klientiem pilnvērtīgi strādāt ar PayTraq datiem, izmantojot dabisko valodu.
+MCP (Model Context Protocol) server for integrating with [PayTraq](https://paytraq.com) — a cloud-based accounting and ERP system. Allows Claude and other MCP clients to manage PayTraq data using natural language.
 
 ---
 
-## Saturs
+## Contents
 
-- [Prasības](#prasības)
-- [Instalācija](#instalācija)
-- [Konfigurācija](#konfigurācija)
-- [Palaišana](#palaišana)
-- [Integrācija ar Claude Desktop](#integrācija-ar-claude-desktop)
-- [Pieejamie rīki](#pieejamie-rīki)
-- [Tehniskie ierobežojumi](#tehniskie-ierobežojumi)
-- [Projekta struktūra](#projekta-struktūra)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Running](#running)
+- [Claude Desktop integration](#claude-desktop-integration)
+- [Available tools](#available-tools)
+- [Technical limits](#technical-limits)
+- [Project structure](#project-structure)
+- [Data formats](#data-formats)
 
 ---
 
-## Prasības
+## Requirements
 
 - Python 3.10+
-- PayTraq konts ar API piekļuvi
-- `PAYTRAQ_API_TOKEN` un `PAYTRAQ_API_KEY` (iegūstami PayTraq iestatījumos)
+- PayTraq account with API access
+- `PAYTRAQ_API_TOKEN` and `PAYTRAQ_API_KEY` (found in PayTraq → Settings → API)
 
 ---
 
-## Instalācija
+## Installation
 
 ```bash
-git clone <repozitorijs>
+git clone https://github.com/nsislv/Paytraq-mcp.git
 cd paytraq-mcp
 
 python -m venv venv
@@ -40,42 +41,42 @@ pip install -r requirements.txt
 
 ---
 
-## Konfigurācija
+## Configuration
 
-Iestatiet vides mainīgos pirms servera palaišanas:
+Set environment variables before starting the server:
 
 ```bash
-export PAYTRAQ_API_TOKEN=jūsu_tokens
-export PAYTRAQ_API_KEY=jūsu_atslēga
+export PAYTRAQ_API_TOKEN=your_token
+export PAYTRAQ_API_KEY=your_key
 ```
 
-API akreditācijas datus var atrast PayTraq → **Iestatījumi → API**.
+Credentials are found in PayTraq → **Settings → API**.
 
 ---
 
-## Palaišana
+## Running
 
 ```bash
 python server.py
 ```
 
-Serveris startēs un būs pieejams caur MCP protokolu.
+The server starts and becomes available via the MCP protocol.
 
 ---
 
-## Integrācija ar Claude Desktop
+## Claude Desktop integration
 
-Pievienojiet konfigurāciju failā `claude_desktop_config.json`:
+Add the following to your `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "paytraq": {
       "command": "python",
-      "args": ["/ceļš/uz/paytraq-mcp/server.py"],
+      "args": ["/path/to/paytraq-mcp/server.py"],
       "env": {
-        "PAYTRAQ_API_TOKEN": "jūsu_tokens",
-        "PAYTRAQ_API_KEY": "jūsu_atslēga"
+        "PAYTRAQ_API_TOKEN": "your_token",
+        "PAYTRAQ_API_KEY": "your_key"
       }
     }
   }
@@ -84,158 +85,174 @@ Pievienojiet konfigurāciju failā `claude_desktop_config.json`:
 
 ---
 
-## Pieejamie rīki
+## Available tools
 
-Kopā: **51 rīks**, sadalīts 4 moduļos.
-
----
-
-### Klienti, piegādātāji, darbinieki (`tools/clients.py`)
-
-| Rīks | Apraksts |
-|------|----------|
-| `list_clients` | Klientu saraksts ar meklēšanu un lapošanu |
-| `get_client` | Klienta detaļas pēc ID |
-| `create_client` | Jauna klienta izveide |
-| `update_client` | Klienta datu atjaunināšana |
-| `get_client_outstanding` | Klienta neapmaksātie rēķini un atlikums |
-| `list_client_contacts` | Klienta kontaktpersonas |
-| `add_client_contact` | Kontaktpersonas pievienošana |
-| `list_client_banks` | Klienta bankas rekvizīti |
-| `list_client_groups` | Klientu grupas |
-| `list_suppliers` | Piegādātāju saraksts |
-| `get_supplier` | Piegādātāja detaļas |
-| `create_supplier` | Jauna piegādātāja izveide |
-| `update_supplier` | Piegādātāja datu atjaunināšana |
-| `list_supplier_groups` | Piegādātāju grupas |
-| `list_employees` | Darbinieku saraksts |
-| `get_employee` | Darbinieka informācija |
-| `create_employee` | Jauna darbinieka pievienošana |
-| `list_employee_groups` | Darbinieku grupas |
+**57 tools** across 5 modules.
 
 ---
 
-### Dokumenti un maksājumi (`tools/documents.py`)
+### Clients, suppliers & employees (`tools/clients.py`)
 
-| Rīks | Apraksts |
-|------|----------|
-| `list_sales` | Pārdošanas dokumentu saraksts (filtri: statuss, datums, klients) |
-| `get_sale` | Rēķina / pasūtījuma detaļas |
-| `create_sale` | Jauna pārdošanas dokumenta izveide |
-| `approve_sale` | Dokumenta apstiprināšana (draft → approved) |
-| `post_sale` | Dokumenta iegrāmatošana grāmatvedībā |
-| `void_sale` | Dokumenta anulēšana |
-| `record_sale_payment` | Maksājuma reģistrēšana |
-| `send_sale` | Dokumenta nosūtīšana pa e-pastu |
-| `get_sale_pdf` | Dokumenta iegūšana PDF formātā |
-| `list_purchases` | Iepirkumu dokumentu saraksts |
-| `get_purchase` | Iepirkuma dokumenta detaļas |
-| `create_purchase` | Jauna iepirkuma dokumenta izveide |
-| `approve_purchase` | Iepirkuma dokumenta apstiprināšana |
-| `post_purchase` | Iepirkuma iegrāmatošana |
-| `record_purchase_payment` | Maksājuma reģistrēšana piegādātājam |
-| `list_payments` | Maksājumu saraksts ar datumu filtru |
-| `get_payment` | Maksājuma detaļas |
-| `list_attachments` | Dokumenta pielikumu saraksts |
-
-**Atbalstītie dokumentu veidi (`create_sale`):**
-- `sales_invoice` — pārdošanas rēķins
-- `sales_order` — pārdošanas pasūtījums
-- `sales_proforma` — proforma rēķins
-- `sales_receipt` — kvīts
-- `credit_note` — kredītnota
+| Tool | Description |
+|------|-------------|
+| `list_clients` | List clients with search and pagination |
+| `get_client` | Get client details by ID |
+| `create_client` | Create a new client |
+| `update_client` | Update client data |
+| `get_client_outstanding` | Get unpaid invoices and outstanding balance for a client |
+| `list_client_contacts` | List contact persons for a client |
+| `add_client_contact` | Add a contact person to a client |
+| `list_client_banks` | Get bank account details for a client |
+| `list_client_groups` | List client groups |
+| `list_suppliers` | List suppliers |
+| `get_supplier` | Get supplier details |
+| `create_supplier` | Create a new supplier |
+| `update_supplier` | Update supplier data |
+| `list_supplier_groups` | List supplier groups |
+| `list_employees` | List employees |
+| `get_employee` | Get employee details |
+| `create_employee` | Add a new employee |
+| `list_employee_groups` | List employee groups |
 
 ---
 
-### Preces, pakalpojumi, noliktava (`tools/products.py`)
+### Sales, purchases & payments (`tools/documents.py`)
 
-| Rīks | Apraksts |
-|------|----------|
-| `list_products` | Preču saraksts (meklēšana pēc nosaukuma, SKU, svītrkoda) |
-| `get_product` | Preces informācija |
-| `create_product` | Jaunas preces izveide |
-| `update_product` | Preces datu atjaunināšana |
-| `get_product_price_list` | Cenrādis pēc cenu grupas |
-| `set_product_price` | Cenas iestatīšana |
-| `list_product_groups` | Preču grupas |
-| `list_lots` | Partiju / lotu saraksts |
-| `add_product_lot` | Jaunas partijas pievienošana |
-| `list_services` | Pakalpojumu saraksts |
-| `get_service` | Pakalpojuma informācija |
-| `create_service` | Jauna pakalpojuma izveide |
-| `update_service` | Pakalpojuma atjaunināšana |
-| `list_service_groups` | Pakalpojumu grupas |
-| `list_warehouses` | Noliktavu saraksts |
-| `get_warehouse` | Noliktavas informācija |
-| `get_current_inventory` | Pašreizējie atlikumi noliktavā |
-| `get_product_inventory` | Preces atlikumi visās noliktavās |
-| `list_loading_areas` | Iekraušanas / izkraušanas zonas |
-| `list_shippers` | Pārvadātāju saraksts |
-| `create_shipper` | Jauna pārvadātāja pievienošana |
+| Tool | Description |
+|------|-------------|
+| `list_sales` | List sales documents (filters: status, date, client) |
+| `get_sale` | Get invoice / order details |
+| `create_sale` | Create a new sales document |
+| `approve_sale` | Approve a document (draft → approved) |
+| `post_sale` | Post a document to the accounting ledger |
+| `void_sale` | Void a document |
+| `record_sale_payment` | Record a payment received |
+| `send_sale` | Email a document to a client |
+| `get_sale_pdf` | Download a document as PDF |
+| `list_purchases` | List purchase documents |
+| `get_purchase` | Get purchase document details |
+| `create_purchase` | Create a new purchase document |
+| `approve_purchase` | Approve a purchase document |
+| `post_purchase` | Post a purchase document to accounting |
+| `record_purchase_payment` | Record a payment to a supplier |
+| `list_payments` | List all payments with date filter |
+| `get_payment` | Get payment details |
+| `list_attachments` | List file attachments on a document |
 
-**Preču veidi (`create_product`):**
-- `1` — Noliktavas prece
-- `2` — Patērējamā prece
-- `3` — Pamatlīdzeklis
-
----
-
-### Grāmatvedība (`tools/accounting.py`)
-
-| Rīks | Apraksts |
-|------|----------|
-| `list_accounts` | Kontu plāns ar meklēšanu pēc nosaukuma vai numura |
-| `get_account` | Konta informācija pēc ID |
-| `list_tax_keys` | Nodokļu likmes (PVN un citi) |
-| `list_journals` | Žurnāla ieraksti ar datumu filtru un lapošanu |
+**Supported document types (`create_sale`):**
+- `sales_invoice` — standard sales invoice
+- `sales_order` — sales order
+- `sales_proforma` — pro-forma invoice
+- `sales_receipt` — receipt
+- `credit_note` — credit note
 
 ---
 
-## Tehniskie ierobežojumi
+### Products, services & warehouse (`tools/products.py`)
 
-PayTraq API ierobežojumi tiek ievēroti **automātiski**:
+| Tool | Description |
+|------|-------------|
+| `list_products` | List products (search by name, SKU, barcode) |
+| `get_product` | Get product details |
+| `create_product` | Create a new product |
+| `update_product` | Update product data |
+| `get_product_price_list` | Get price list for a price group |
+| `set_product_price` | Set a product price |
+| `list_product_groups` | List product groups |
+| `list_lots` | List product lots / batches |
+| `add_product_lot` | Add a new lot to a product |
+| `list_services` | List service items |
+| `get_service` | Get service details |
+| `create_service` | Create a new service item |
+| `update_service` | Update a service item |
+| `list_service_groups` | List service groups |
+| `list_warehouses` | List warehouses |
+| `get_warehouse` | Get warehouse details |
+| `get_current_inventory` | Get current stock levels at a warehouse |
+| `get_product_inventory` | Get stock levels for a product across all warehouses |
+| `list_loading_areas` | List loading / unloading areas |
+| `list_shippers` | List shipping carriers |
+| `create_shipper` | Add a new shipping carrier |
 
-| Parametrs | Vērtība |
-|-----------|---------|
-| Vidējais ātrums | 1 pieprasījums/sek |
-| Burst | līdz 5 pieprasījumiem |
-| Dienas limits | 5 000 pieprasījumu (atiestatās pusnaktī UTC) |
-| Pieprasījuma timeout | 30 sekundes |
-| Lappuses izmērs | 100 ieraksti |
-
-Kļūdu gadījumā (429, 5xx) notiek automātiska atkārtošana ar eksponenciālu aizkavi.
+**Product types (`create_product`):**
+- `1` — Storable product (tracked inventory)
+- `2` — Consumable (expensed on purchase)
+- `3` — Fixed asset (depreciated)
 
 ---
 
-## Projekta struktūra
+### Accounting (`tools/accounting.py`)
+
+| Tool | Description |
+|------|-------------|
+| `list_accounts` | List chart of accounts (search by name or code) |
+| `get_account` | Get account details by ID |
+| `list_tax_keys` | List tax / VAT rates |
+| `list_journals` | List journal entries with date filter and pagination |
+
+---
+
+### Financial reports (`tools/reports.py`)
+
+| Tool | Description |
+|------|-------------|
+| `profit_and_loss` | Generate a P&L (income statement) for any date range |
+| `balance_sheet` | Generate a balance sheet snapshot as of a given date |
+| `quarterly_report` | Combined P&L + balance sheet for a full quarter |
+
+> **Note:** Report figures are computed by aggregating general ledger journal
+> entries. They may differ from official NSIS.LV / PayTraq PDF reports, which
+> use the sub-ledger. No direct account-balance API endpoint is available in
+> PayTraq v2.57.
+
+---
+
+## Technical limits
+
+PayTraq API limits are enforced **automatically**:
+
+| Parameter | Value |
+|-----------|-------|
+| Average rate | 1 request/sec |
+| Burst | up to 5 requests |
+| Daily limit | 5,000 requests (resets at midnight UTC) |
+| Request timeout | 30 seconds |
+| Page size | 100 records |
+
+On 429 / 5xx errors the client retries automatically with exponential back-off.
+
+---
+
+## Project structure
 
 ```
 paytraq-mcp/
-├── server.py              # MCP servera ieejas punkts (FastMCP)
-├── paytraq_client.py      # HTTP klients ar rate limiting un XML parsēšanu
-├── requirements.txt       # Python atkarības
+├── server.py              # MCP server entry point (FastMCP)
+├── paytraq_client.py      # HTTP client with rate limiting and XML parsing
+├── requirements.txt       # Python dependencies
 └── tools/
     ├── __init__.py
-    ├── clients.py         # Klienti, piegādātāji, darbinieki
-    ├── documents.py       # Pārdošana, iepirkumi, maksājumi
-    ├── products.py        # Preces, pakalpojumi, noliktava
-    └── accounting.py      # Grāmatvedība, nodokļi, žurnāli
+    ├── clients.py         # Clients, suppliers, employees
+    ├── documents.py       # Sales, purchases, payments
+    ├── products.py        # Products, services, warehouse
+    ├── accounting.py      # Accounting, taxes, journals
+    └── reports.py         # Financial reports (P&L, balance sheet)
 ```
 
 ---
 
-## Datu formāti
+## Data formats
 
-| Formāts | Vērtība |
-|---------|---------|
-| Datums | `YYYY-MM-DD` |
-| Decimāldalītājs | punkts (piemēram, `10.90`) |
-| Valūtas kods | ISO 4217 (`EUR`, `USD`, `GBP` ...) |
-| Valsts kods | ISO 3166-1 alpha-2 (`LV`, `EE`, `LT`, `DE` ...) |
-| API atbildes | JSON (automātiski konvertēts no XML) |
+| Format | Value |
+|--------|-------|
+| Dates | `YYYY-MM-DD` |
+| Decimal separator | dot (e.g. `10.90`) |
+| Currency code | ISO 4217 (`EUR`, `USD`, `GBP` ...) |
+| Country code | ISO 3166-1 alpha-2 (`LV`, `EE`, `LT`, `DE` ...) |
+| API responses | JSON (auto-converted from XML) |
 
 ---
 
-## Licence
+## License
 
-Privāts projekts. Visas tiesības aizsargātas.
+Private project. All rights reserved.

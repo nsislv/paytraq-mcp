@@ -1,30 +1,30 @@
 """
 PayTraq MCP Server
 ------------------
-MCP-сервер для интеграции с PayTraq — облачной системой учёта.
+MCP server for integrating with PayTraq — a cloud-based accounting and ERP system.
 
-Покрывает полный API v2.57:
-  • Клиенты, поставщики, сотрудники
-  • Документы продаж и закупок, платежи
-  • Товары, услуги, склад, инвентарь
-  • Бухгалтерия, налоги, журналы
+Covers the full API v2.57:
+  • Clients, suppliers, employees
+  • Sales and purchase documents, payments
+  • Products, services, warehouse, inventory
+  • Accounting, taxes, journals, financial reports
 
-Требования:
-  PAYTRAQ_API_TOKEN — токен из настроек PayTraq
-  PAYTRAQ_API_KEY   — ключ API из настроек PayTraq
+Requirements:
+  PAYTRAQ_API_TOKEN — token from PayTraq settings
+  PAYTRAQ_API_KEY   — API key from PayTraq settings
 
-Запуск:
+Usage:
   PAYTRAQ_API_TOKEN=xxx PAYTRAQ_API_KEY=yyy python server.py
 
-Rate limits (соблюдаются автоматически):
-  1 запрос/сек avg | burst 5 | 5000 запросов/сутки
+Rate limits (enforced automatically):
+  1 req/sec avg | burst 5 | 5000 requests/day
 """
 
 import os
 import sys
 from mcp.server.fastmcp import FastMCP
 
-# ── Проверка переменных окружения ─────────────────────────────────────────────
+# ── Environment variable check ────────────────────────────────────────────────
 
 _TOKEN = os.getenv("PAYTRAQ_API_TOKEN", "")
 _KEY   = os.getenv("PAYTRAQ_API_KEY", "")
@@ -39,7 +39,7 @@ if not _TOKEN or not _KEY:
     )
     sys.exit(1)
 
-# ── Инициализация MCP ─────────────────────────────────────────────────────────
+# ── MCP initialisation ────────────────────────────────────────────────────────
 
 mcp = FastMCP(
     "PayTraq",
@@ -55,7 +55,7 @@ mcp = FastMCP(
     ),
 )
 
-# ── Регистрация инструментов ──────────────────────────────────────────────────
+# ── Tool registration ─────────────────────────────────────────────────────────
 
 from tools import clients, documents, products, accounting, reports
 
@@ -65,7 +65,7 @@ products.register(mcp)
 accounting.register(mcp)
 reports.register(mcp)
 
-# ── Запуск ────────────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     mcp.run()

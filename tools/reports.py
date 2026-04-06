@@ -31,40 +31,40 @@ def _validate_date(value: Optional[str], field_name: str) -> Optional[str]:
     return None
 
 
-# ── Группировка счетов P&L (из официальных отчётов NSIS.LV) ──────────────────
+# ── P&L account groupings (based on official NSIS.LV / PayTraq chart of accounts) ──
 
-# Доходы
+# Revenue
 REVENUE_ACCOUNTS = {"6110", "6120", "6130", "6140", "6150", "6160", "6170", "6180", "6190"}
 
-# Себестоимость (COGS / Ražošanas izmaksas)
+# Cost of goods sold (COGS / production costs)
 COGS_ACCOUNTS = {"7120", "7130", "7140", "7150", "7160", "7170", "7210", "7220",
                  "7310", "7320", "7330", "7340", "7350", "7360", "7370", "7380",
                  "7390", "7420", "7430"}
 
-# Операционные — продажи
+# Operating expenses — sales
 SALES_ACCOUNTS = {"7610", "7620", "7630", "7640", "7650"}
 
-# Операционные — администрация
+# Operating expenses — administration
 ADMIN_ACCOUNTS = {"7710", "7720", "7730", "7740", "7750", "7760", "7770", "7780", "7790"}
 
-# Прочие операционные расходы
+# Other operating expenses
 OTHER_OP_ACCOUNTS = {"7510", "7520", "7530", "7540", "7550", "7560", "7570", "7580",
                      "7590", "7600"}
 
-# Финансовые расходы/доходы
+# Finance income / expenses
 FINANCE_ACCOUNTS = {"8110", "8120", "8130", "8140", "8150",
                     "8210", "8220", "8230", "8240", "8250", "8260",
                     "8510", "8520", "8530"}
 
-# Налоги
+# Taxes
 TAX_ACCOUNTS = {"8810", "8820", "8830", "8840", "8850"}
 
-# Чрезвычайные статьи
+# Extraordinary items
 EXTRAORDINARY_ACCOUNTS = {"8610", "8620", "8630"}
 
-# Балансовые счета (только реальные, без транзитных) ───────────────────────────
+# ── Balance sheet accounts (real accounts only — transit accounts excluded) ───
 
-# Активы — ТОЛЬКО реальные балансовые (не транзитные)
+# Non-current assets — real balance accounts only (no transit accounts)
 ASSET_NONCURRENT = {
     "1110", "1120", "1130", "1140", "1150", "1160", "1170", "1180", "1190",
     "1191", "1192", "1193", "1194",
@@ -84,16 +84,16 @@ ASSET_CURRENT = {
     "2630",
 }
 
-# ИСКЛЮЧАЕМ транзитные/технические счета из баланса:
+# Transit / technical asset accounts excluded from the balance sheet
 EXCLUDED_ASSET_ACCOUNTS = {
-    "2670",  # Pārējie naudas līdzekļi (transit)
-    "2680",  # Savstarpējas ieskaites tranzīta konts
-    "2380",  # Prasības un īstermiņa aizdevumi (межкомпанийные)
-    "1260",  # Avansa maksājumi par pamatlīdzekļiem (transit)
-    "2197",  # Pārmaksas kreditoriem (overpayments - offset by liabilities)
+    "2670",  # Other cash equivalents (transit)
+    "2680",  # Inter-company clearing account (transit)
+    "2380",  # Inter-company loans and receivables
+    "1260",  # Advance payments for fixed assets (transit)
+    "2197",  # Overpayments to creditors (offset by liabilities)
 }
 
-# Собственный капитал
+# Equity
 EQUITY_ACCOUNTS = {
     "3110", "3120", "3130", "3140", "3150",
     "3210", "3220", "3230", "3240",
@@ -101,7 +101,7 @@ EQUITY_ACCOUNTS = {
     "3410", "3420",
 }
 
-# Обязательства краткосрочные (только реальные)
+# Current liabilities (real accounts only)
 LIAB_CURRENT = {
     "5110", "5120", "5130", "5140",
     "5210", "5220", "5230",
@@ -114,7 +114,7 @@ LIAB_CURRENT = {
     "5810", "5820",
 }
 
-# Обязательства долгосрочные
+# Non-current liabilities
 LIAB_NONCURRENT = {
     "4110", "4120", "4130", "4140",
     "4210", "4220", "4230",
@@ -122,15 +122,15 @@ LIAB_NONCURRENT = {
     "4410",
 }
 
-# ИСКЛЮЧАЕМ технические счета из пассива:
+# Technical liability accounts excluded from the balance sheet
 EXCLUDED_LIAB_ACCOUNTS = {
-    "5610",  # Norēķini par darba algu (часто транзит)
-    "5724",  # Norēķini par PVN (transit offset)
+    "5610",  # Payroll settlements (often used as transit)
+    "5724",  # VAT settlement offset (transit)
 }
 
 
 def _load_accounts() -> dict:
-    """Загружает план счетов: AccountID → {code, name, acc_type}."""
+    """Loads the chart of accounts: AccountID → {code, name, acc_type}."""
     result = get("accounts")
     raw = result.get("Accounts", {}).get("Account", [])
     if isinstance(raw, dict):
@@ -152,8 +152,8 @@ def _load_accounts() -> dict:
 def _load_journal_balances(date_from: Optional[str] = None,
                             date_till: Optional[str] = None) -> dict:
     """
-    Агрегирует балансы из журнальных проводок.
-    Возвращает {AccountID: net_balance} где net = sum(DR) - sum(CR).
+    Aggregates account balances from journal entries.
+    Returns {AccountID: net_balance} where net = sum(DR) - sum(CR).
     """
     balances: dict = defaultdict(float)
     page = 0
