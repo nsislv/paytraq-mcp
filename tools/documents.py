@@ -1,666 +1,610 @@
 """
-PayTraq MCP — Sales & Purchase Documents Tools
-------------------------------------------------
-Tools for managing sales documents (invoices, orders, receipts, credit notes),
-purchase documents (vendor orders and invoices), payments, and attachments.
+PayTraq MCP — Sales, purchases, payments, and attachments.
 
-When to use these tools:
-  - list_sales / get_sale: browse or retrieve customer invoices and orders
-  - create_sale: issue a new invoice, sales order, or receipt to a client
-  - approve_sale / post_sale: move a draft through the accounting workflow
-  - record_sale_payment: mark an invoice as paid
-  - send_sale: email an invoice directly to a client
-  - list_purchases / create_purchase: manage vendor invoices and purchase orders
-  - list_payments: review all incoming/outgoing payment records
+Covers the document lifecycle:
+  draft → approved → posted → paid (or voided)
+
+Line items for create_sale / create_purchase must be a list of dicts, each with
+ItemID / Qty / Price at a minimum. The XML builder serialises lists as repeated
+elements so `{"LineItems": [{...}, {...}]}` becomes valid PayTraq XML.
 """
 
-import re
-from typing import Annotated, Optional
-from pydantic import Field
+from __future__ import annotations
+
+from typing import Annotated, Any, Optional
+
 from mcp.server.fastmcp import FastMCP
-from paytraq_client import get, post, format_response
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
-_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+from paytraq_client import (
+    PaytraqBadRequest,
+    format_list,
+    format_single,
+    get,
+    parse_list,
+    post,
+)
+from tools._common import (
+    ResponseFormat,
+    drop_none,
+    ensure_currency,
+    ensure_date,
+    ensure_email,
+    ensure_in,
+)
 
-VALID_SALE_STATUSES = {"draft", "approved", "posted", "paid", "voided"}
-VALID_SALE_TYPES = {"sales_invoice", "sales_order", "sales_proforma", "sales_receipt", "credit_note"}
-VALID_OPERATIONS = {"sell_goods", "sell_services", "other_income"}
+VALID_STATUSES: set[str] = {"draft", "approved", "posted", "paid", "voided"}
+VALID_SALE_TYPES: set[str] = {
+    "sales_invoice", "sales_order", "sales_proforma", "sales_receipt", "credit_note",
+}
+VALID_OPERATIONS: set[str] = {"sell_goods", "sell_services", "other_income"}
 
 
-def _validate_date(value: Optional[str], field_name: str) -> Optional[str]:
-    if value and not _DATE_RE.match(value):
-        return f"Invalid {field_name} format '{value}'. Use YYYY-MM-DD (e.g. 2026-01-31)."
-    return None
+READ_ONLY = ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+)
+WRITE_ADDITIVE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True
+)
+WRITE_IDEMPOTENT = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True
+)
+WRITE_DESTRUCTIVE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True
+)
+WRITE_SEND = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True
+)
+
+
+def _normalise_line_items(items: Optional[list]) -> Optional[list[dict]]:
+    """
+    Validate and normalise line-item dicts for create_sale / create_purchase.
+    Each item must be a mapping; ItemID is required, Qty/Price recommended.
+    """
+    if items is None:
+        return None
+    if not isinstance(items, list) or not items:
+        raise PaytraqBadRequest(
+            "Line items must be a non-empty list of dicts, e.g. "
+            '[{"ItemID": 42, "Qty": 2, "Price": 15.00}].'
+        )
+    normalised: list[dict] = []
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise PaytraqBadRequest(
+                f"Line item #{idx + 1} must be a dict with keys ItemID / Qty / Price."
+            )
+        if "ItemID" not in item:
+            raise PaytraqBadRequest(
+                f"Line item #{idx + 1} is missing 'ItemID' — call "
+                "paytraq_list_products or paytraq_list_services to find it."
+            )
+        normalised.append({k: v for k, v in item.items() if v is not None})
+    return normalised
 
 
 def register(mcp: FastMCP) -> None:
 
-    # ── SALES DOCUMENTS ───────────────────────────────────────────────────────
+    # ── Sales documents ───────────────────────────────────────────────────────
 
-    @mcp.tool()
-    def list_sales(
+    @mcp.tool(
+        name="paytraq_list_sales",
+        title="List sales documents",
+        annotations=READ_ONLY,
+    )
+    def paytraq_list_sales(
         status: Annotated[Optional[str], Field(
-            default=None,
-            description=(
-                "Filter by document status. "
-                "Valid values: draft, approved, posted, paid, voided."
-            ),
+            description=f"Filter by status. One of: {', '.join(sorted(VALID_STATUSES))}.",
         )] = None,
         date_from: Annotated[Optional[str], Field(
-            default=None,
-            description="Start date filter in YYYY-MM-DD format (e.g. 2026-01-01).",
+            description="Document date lower bound (YYYY-MM-DD).",
         )] = None,
         date_till: Annotated[Optional[str], Field(
-            default=None,
-            description="End date filter in YYYY-MM-DD format (e.g. 2026-12-31).",
+            description="Document date upper bound (YYYY-MM-DD).",
         )] = None,
         client_id: Annotated[Optional[int], Field(
-            default=None,
-            description="Filter to only show documents for this client ID.",
-            gt=0,
+            gt=0, description="Filter to one ClientID.",
         )] = None,
         query: Annotated[Optional[str], Field(
-            default=None,
             description="Text search by document number or reference.",
         )] = None,
-        page: Annotated[int, Field(
-            default=0,
-            ge=0,
-            description="Page number for pagination (100 records per page).",
-        )] = 0,
+        page: Annotated[int, Field(ge=0, description="0-indexed page (100/page).")] = 0,
         reverse: Annotated[bool, Field(
-            default=False,
-            description="Set True to sort results newest-first (descending by date).",
+            description="True = newest-first ordering.",
         )] = False,
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
         """
-        List sales documents (invoices, orders, receipts, credit notes) in PayTraq.
+        List sales documents (invoices, orders, receipts, proformas, credit notes).
 
-        Use this tool when you need to:
-        - Review all unpaid invoices (status=approved or posted)
-        - Find invoices for a specific client
-        - Check recent sales activity for a date range
-        - Look up a document by number
+        Common filters:
+          - status='approved' or 'posted' → outstanding invoices
+          - client_id=N → all documents for one customer
+          - date_from / date_till → period-based reporting
         """
-        try:
-            if status and status not in VALID_SALE_STATUSES:
-                return (
-                    f"Error: Invalid status '{status}'. "
-                    f"Valid values: {', '.join(sorted(VALID_SALE_STATUSES))}."
-                )
-            for val, name in [(date_from, "date_from"), (date_till, "date_till")]:
-                err = _validate_date(val, name)
-                if err:
-                    return f"Error: {err}"
+        ensure_in(status, VALID_STATUSES, "status")
+        ensure_date(date_from, "date_from")
+        ensure_date(date_till, "date_till")
 
-            params: dict = {"page": page}
-            if status:    params["status"] = status
-            if date_from: params["date_from"] = date_from
-            if date_till: params["date_till"] = date_till
-            if client_id: params["client_id"] = client_id
-            if query:     params["query"] = query
-            if reverse:   params["reverse"] = "true"
-            return format_response(get("sales", params))
-        except Exception as e:
-            raise
+        params: dict = {"page": page}
+        if status:    params["status"] = status
+        if date_from: params["date_from"] = date_from
+        if date_till: params["date_till"] = date_till
+        if client_id: params["client_id"] = client_id
+        if query:     params["query"] = query
+        if reverse:   params["reverse"] = "true"
+        parsed = get("sales", params)
+        return format_list(parse_list(parsed, page=page), response_format.value)
 
-    @mcp.tool()
-    def get_sale(
-        document_id: Annotated[int, Field(
-            description="Numeric PayTraq sales document ID.",
-            gt=0,
-        )],
+    @mcp.tool(
+        name="paytraq_get_sale",
+        title="Get a sales document",
+        annotations=READ_ONLY,
+    )
+    def paytraq_get_sale(
+        document_id: Annotated[int, Field(gt=0, description="Sales DocumentID.")],
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
-        """
-        Get full details of a sales document (invoice, order, receipt) by ID.
+        """Return full sales document: line items, totals, due date, payment status, client."""
+        parsed = get(f"sale/{document_id}")
+        return format_single(parsed, response_format.value)
 
-        Use this tool when you need line items, amounts, due date, payment status,
-        or client details for a specific document.
-        """
-        try:
-            return format_response(get(f"sale/{document_id}"))
-        except Exception as e:
-            raise
-
-    @mcp.tool()
-    def create_sale(
-        client_id: Annotated[int, Field(
-            description="PayTraq client ID to invoice. Use list_clients to find it.",
-            gt=0,
-        )],
+    @mcp.tool(
+        name="paytraq_create_sale",
+        title="Create a sales document",
+        annotations=WRITE_ADDITIVE,
+    )
+    def paytraq_create_sale(
+        client_id: Annotated[int, Field(gt=0, description="Target ClientID (customer).")],
         document_date: Annotated[str, Field(
-            description="Document date in YYYY-MM-DD format (e.g. 2026-01-15).",
+            description="Document date (YYYY-MM-DD).",
         )],
         sale_type: Annotated[str, Field(
-            default="sales_invoice",
             description=(
-                "Document type: sales_invoice (standard invoice), sales_order, "
-                "sales_proforma (pro-forma), sales_receipt, credit_note."
+                "Document type. One of: sales_invoice, sales_order, sales_proforma, "
+                "sales_receipt, credit_note."
             ),
         )] = "sales_invoice",
         operation: Annotated[str, Field(
-            default="sell_goods",
-            description=(
-                "Revenue type: sell_goods (product sale), "
-                "sell_services (service delivery), other_income."
-            ),
+            description="Revenue type: sell_goods | sell_services | other_income.",
         )] = "sell_goods",
         currency: Annotated[str, Field(
-            default="EUR",
-            description="ISO 4217 currency code for the document (e.g. EUR, USD).",
+            description="ISO 4217 currency (EUR, USD, ...).",
         )] = "EUR",
         items: Annotated[Optional[list], Field(
-            default=None,
             description=(
-                "Line items for the document. Each item is a dict with keys: "
-                "ItemID (int), Qty (float), Price (float). "
-                "Example: [{\"ItemID\": 42, \"Qty\": 2, \"Price\": 150.00}]"
+                "Line items — a list of dicts with keys ItemID (int, required), "
+                "Qty (number), Price (number). "
+                'Example: [{"ItemID": 42, "Qty": 2, "Price": 150.00}, '
+                '{"ItemID": 99, "Qty": 1, "Price": 49.50}]'
             ),
         )] = None,
         ref_number: Annotated[Optional[str], Field(
-            default=None,
-            description="Custom document reference number (e.g. your PO number).",
+            description="External reference (e.g. the customer's PO number).",
         )] = None,
         due_date: Annotated[Optional[str], Field(
-            default=None,
-            description="Payment due date in YYYY-MM-DD format.",
+            description="Payment due date (YYYY-MM-DD).",
         )] = None,
         comment: Annotated[Optional[str], Field(
-            default=None,
-            description="Notes or memo printed on the document.",
+            description="Notes printed on the document.",
         )] = None,
         warehouse_id: Annotated[Optional[int], Field(
-            default=None,
-            description="Source warehouse ID for goods. Use list_warehouses to find it.",
-            gt=0,
+            gt=0, description="Source WarehouseID for goods.",
         )] = None,
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
         """
-        Create a new sales document (invoice, order, receipt, etc.) in PayTraq.
+        Create a new sales document and return its DocumentID.
 
-        Use this tool when:
-        - Issuing a new invoice to a customer
-        - Creating a pro-forma invoice for approval
-        - Recording a cash sale receipt
-        - Issuing a credit note for a return
-
-        After creation, use approve_sale and post_sale to move it through the workflow,
-        then record_sale_payment when the client pays.
+        The document starts in 'draft' status. The workflow is:
+          1. paytraq_create_sale         → draft
+          2. paytraq_approve_sale        → approved
+          3. paytraq_post_sale           → posted (creates journal entries)
+          4. paytraq_record_sale_payment → paid
         """
-        try:
-            err = _validate_date(document_date, "document_date")
-            if err:
-                return f"Error: {err}"
-            err = _validate_date(due_date, "due_date")
-            if err:
-                return f"Error: {err}"
-            if sale_type not in VALID_SALE_TYPES:
-                return (
-                    f"Error: Invalid sale_type '{sale_type}'. "
-                    f"Valid values: {', '.join(sorted(VALID_SALE_TYPES))}."
-                )
-            if operation not in VALID_OPERATIONS:
-                return (
-                    f"Error: Invalid operation '{operation}'. "
-                    f"Valid values: {', '.join(sorted(VALID_OPERATIONS))}."
-                )
+        ensure_date(document_date, "document_date")
+        ensure_date(due_date, "due_date")
+        ensure_in(sale_type, VALID_SALE_TYPES, "sale_type")
+        ensure_in(operation, VALID_OPERATIONS, "operation")
+        currency = ensure_currency(currency) or "EUR"
+        line_items = _normalise_line_items(items)
 
-            data: dict = {
-                "ClientID": client_id,
-                "DocumentDate": document_date,
-                "SaleType": sale_type,
-                "Operation": operation,
-                "Currency": currency.upper(),
-            }
-            if ref_number:    data["DocumentRef"] = ref_number
-            if due_date:      data["DueDate"] = due_date
-            if comment:       data["Comment"] = comment
-            if warehouse_id:  data["WarehouseID"] = warehouse_id
-            if items:         data["LineItems"] = {"LineItem": items}
+        data: dict[str, Any] = drop_none({
+            "ClientID": client_id,
+            "DocumentDate": document_date,
+            "SaleType": sale_type,
+            "Operation": operation,
+            "Currency": currency,
+            "DocumentRef": ref_number,
+            "DueDate": due_date,
+            "Comment": comment,
+            "WarehouseID": warehouse_id,
+        })
+        if line_items:
+            # build_xml expands lists as repeated <LineItem> siblings.
+            data["LineItems"] = {"LineItem": line_items}
 
-            return format_response(post("sales", data, "Document"))
-        except Exception as e:
-            raise
+        parsed = post("sales", data, "Document")
+        return format_single(parsed, response_format.value)
 
-    @mcp.tool()
-    def approve_sale(
-        document_id: Annotated[int, Field(
-            description="ID of the sales document to approve.",
-            gt=0,
-        )],
+    @mcp.tool(
+        name="paytraq_approve_sale",
+        title="Approve a sales document",
+        annotations=WRITE_IDEMPOTENT,
+    )
+    def paytraq_approve_sale(
+        document_id: Annotated[int, Field(gt=0, description="DocumentID to approve.")],
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
         """
-        Approve a sales document, moving it from 'draft' to 'approved' status.
+        Move a sales document from 'draft' to 'approved'.
 
-        Use this tool after creating a draft invoice and it has been reviewed.
-        Once approved, the document can be sent to the client or posted to accounting.
+        Approved documents can be emailed to the customer and then posted to
+        the accounting ledger.
         """
-        try:
-            return format_response(post(f"sale/{document_id}/approve", {}, "Document"))
-        except Exception as e:
-            raise
+        parsed = post(f"sale/{document_id}/approve", {}, "Document")
+        return format_single(parsed, response_format.value)
 
-    @mcp.tool()
-    def post_sale(
-        document_id: Annotated[int, Field(
-            description="ID of the sales document to post to accounting.",
-            gt=0,
-        )],
+    @mcp.tool(
+        name="paytraq_post_sale",
+        title="Post a sales document to the ledger",
+        annotations=WRITE_IDEMPOTENT,
+    )
+    def paytraq_post_sale(
+        document_id: Annotated[int, Field(gt=0, description="DocumentID to post.")],
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
         """
-        Post a sales document to the accounting ledger ('posted' status).
+        Post an approved sales document to the general ledger.
 
-        Use this tool after approving an invoice to record it as a formal
-        accounting entry. This creates journal entries in the general ledger.
+        This creates immutable journal entries and changes status from 'approved'
+        to 'posted'. Reversing a posted document requires a credit_note.
         """
-        try:
-            return format_response(post(f"sale/{document_id}/post", {}, "Document"))
-        except Exception as e:
-            raise
+        parsed = post(f"sale/{document_id}/post", {}, "Document")
+        return format_single(parsed, response_format.value)
 
-    @mcp.tool()
-    def void_sale(
-        document_id: Annotated[int, Field(
-            description="ID of the sales document to void/cancel.",
-            gt=0,
-        )],
+    @mcp.tool(
+        name="paytraq_void_sale",
+        title="Void a sales document",
+        annotations=WRITE_DESTRUCTIVE,
+    )
+    def paytraq_void_sale(
+        document_id: Annotated[int, Field(gt=0, description="DocumentID to void.")],
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
         """
-        Void (cancel) a sales document. This action cannot be undone.
+        Void (cancel) a sales document — cannot be undone.
 
-        Use this tool when a document was created in error or needs to be cancelled.
-        Use a credit_note instead if you need to reverse a posted invoice properly.
+        Use only for drafts created in error. For posted/paid documents, issue a
+        credit_note via paytraq_create_sale instead to preserve the audit trail.
         """
-        try:
-            return format_response(post(f"sale/{document_id}/void", {}, "Document"))
-        except Exception as e:
-            raise
+        parsed = post(f"sale/{document_id}/void", {}, "Document")
+        return format_single(parsed, response_format.value)
 
-    @mcp.tool()
-    def record_sale_payment(
-        document_id: Annotated[int, Field(
-            description="ID of the sales document being paid.",
-            gt=0,
-        )],
+    @mcp.tool(
+        name="paytraq_record_sale_payment",
+        title="Record a customer payment",
+        annotations=WRITE_ADDITIVE,
+    )
+    def paytraq_record_sale_payment(
+        document_id: Annotated[int, Field(gt=0, description="Sales DocumentID being paid.")],
         amount: Annotated[float, Field(
-            description="Payment amount. Use dot as decimal separator (e.g. 150.00).",
             gt=0,
+            description="Payment amount with dot decimal separator (e.g. 150.00).",
         )],
         payment_date: Annotated[str, Field(
-            description="Date the payment was received, in YYYY-MM-DD format.",
+            description="Date payment was received (YYYY-MM-DD).",
         )],
         payment_method: Annotated[Optional[str], Field(
-            default=None,
-            description="Payment method (e.g. 'cash', 'bank_transfer', 'card').",
+            description="Method hint: 'cash', 'bank_transfer', 'card', etc.",
         )] = None,
         comment: Annotated[Optional[str], Field(
-            default=None,
-            description="Internal note about this payment (e.g. bank transaction ID).",
+            description="Internal note (e.g. bank transaction reference).",
         )] = None,
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
         """
-        Record a payment received against a sales invoice or document.
+        Record a payment received against a sales document.
 
-        Use this tool when a customer has paid an invoice. For partial payments,
-        call this tool multiple times with the partial amounts.
+        For partial payments, call this multiple times with the partial amounts —
+        each call adds a Payment record and updates the document's paid balance.
         """
-        try:
-            err = _validate_date(payment_date, "payment_date")
-            if err:
-                return f"Error: {err}"
+        ensure_date(payment_date, "payment_date")
+        data = drop_none({
+            "Amount": amount,
+            "PaymentDate": payment_date,
+            "PaymentMethod": payment_method,
+            "Comment": comment,
+        })
+        parsed = post(f"sale/{document_id}/payment", data, "Payment")
+        return format_single(parsed, response_format.value)
 
-            data: dict = {
-                "Amount": amount,
-                "PaymentDate": payment_date,
-            }
-            if payment_method: data["PaymentMethod"] = payment_method
-            if comment:        data["Comment"] = comment
-            return format_response(post(f"sale/{document_id}/payment", data, "Payment"))
-        except Exception as e:
-            raise
-
-    @mcp.tool()
-    def send_sale(
-        document_id: Annotated[int, Field(
-            description="ID of the sales document to send by email.",
-            gt=0,
-        )],
+    @mcp.tool(
+        name="paytraq_send_sale",
+        title="Email a sales document",
+        annotations=WRITE_SEND,
+    )
+    def paytraq_send_sale(
+        document_id: Annotated[int, Field(gt=0, description="DocumentID to email.")],
         email: Annotated[Optional[str], Field(
-            default=None,
             description=(
-                "Recipient email address. If omitted, PayTraq uses the client's "
-                "default email on record."
+                "Recipient email. Omit to use the client's default email on record."
             ),
         )] = None,
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
         """
-        Send a sales document to the client by email.
+        Send the sales document to the customer as a PDF attachment.
 
-        Use this tool after approving or posting an invoice to deliver it
-        to the customer. PayTraq sends a PDF attachment.
+        Non-idempotent: each call actually sends another email. Use with care.
         """
-        try:
-            if email and not _EMAIL_RE.match(email):
-                return f"Error: Invalid email address '{email}'."
-            data: dict = {}
-            if email: data["Email"] = email
-            return format_response(post(f"sale/{document_id}/send", data, "Send"))
-        except Exception as e:
-            raise
+        email = ensure_email(email)
+        data = drop_none({"Email": email})
+        parsed = post(f"sale/{document_id}/send", data, "Send")
+        return format_single(parsed, response_format.value)
 
-    @mcp.tool()
-    def get_sale_pdf(
-        document_id: Annotated[int, Field(
-            description="ID of the sales document to get PDF data for.",
-            gt=0,
-        )],
+    @mcp.tool(
+        name="paytraq_get_sale_pdf",
+        title="Get sales document PDF",
+        annotations=READ_ONLY,
+    )
+    def paytraq_get_sale_pdf(
+        document_id: Annotated[int, Field(gt=0, description="DocumentID.")],
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
-        """
-        Get the PDF download URL or base64 content for a sales document.
+        """Return the PDF download URL (or base64 payload) for a sales document."""
+        parsed = get(f"sale/{document_id}/pdf")
+        return format_single(parsed, response_format.value)
 
-        Use this tool when you need to download or share the PDF version of an
-        invoice. Returns the URL or encoded PDF data from the PayTraq API.
-        """
-        try:
-            return format_response(get(f"sale/{document_id}/pdf"))
-        except Exception as e:
-            raise
+    # ── Purchase documents ────────────────────────────────────────────────────
 
-    # ── PURCHASES ─────────────────────────────────────────────────────────────
-
-    @mcp.tool()
-    def list_purchases(
+    @mcp.tool(
+        name="paytraq_list_purchases",
+        title="List purchase documents",
+        annotations=READ_ONLY,
+    )
+    def paytraq_list_purchases(
         status: Annotated[Optional[str], Field(
-            default=None,
-            description=(
-                "Filter by document status. "
-                "Valid values: draft, approved, posted, paid, voided."
-            ),
+            description=f"Filter by status. One of: {', '.join(sorted(VALID_STATUSES))}.",
         )] = None,
-        date_from: Annotated[Optional[str], Field(
-            default=None,
-            description="Start date filter in YYYY-MM-DD format.",
-        )] = None,
-        date_till: Annotated[Optional[str], Field(
-            default=None,
-            description="End date filter in YYYY-MM-DD format.",
-        )] = None,
+        date_from: Annotated[Optional[str], Field(description="Start date (YYYY-MM-DD).")] = None,
+        date_till: Annotated[Optional[str], Field(description="End date (YYYY-MM-DD).")] = None,
         supplier_id: Annotated[Optional[int], Field(
-            default=None,
-            description="Filter to only show documents from this supplier ID.",
-            gt=0,
+            gt=0, description="Filter to one SupplierID.",
         )] = None,
-        page: Annotated[int, Field(
-            default=0,
-            ge=0,
-            description="Page number (100 records per page).",
-        )] = 0,
+        page: Annotated[int, Field(ge=0, description="0-indexed page (100/page).")] = 0,
         reverse: Annotated[bool, Field(
-            default=False,
-            description="Set True to sort results newest-first.",
+            description="True = newest-first ordering.",
         )] = False,
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
         """
-        List purchase documents (vendor invoices, purchase orders) in PayTraq.
+        List purchase documents (vendor invoices, POs).
 
-        Use this tool when you need to:
-        - Review unpaid vendor invoices
-        - Check purchase history from a specific supplier
-        - Reconcile incoming invoices for a date range
+        Typical uses:
+          - status='approved'/'posted' and not paid → outstanding AP
+          - supplier_id=N → full purchase history from one vendor
+          - date range → reconcile invoices for a period
         """
-        try:
-            if status and status not in VALID_SALE_STATUSES:
-                return (
-                    f"Error: Invalid status '{status}'. "
-                    f"Valid values: {', '.join(sorted(VALID_SALE_STATUSES))}."
-                )
-            for val, name in [(date_from, "date_from"), (date_till, "date_till")]:
-                err = _validate_date(val, name)
-                if err:
-                    return f"Error: {err}"
+        ensure_in(status, VALID_STATUSES, "status")
+        ensure_date(date_from, "date_from")
+        ensure_date(date_till, "date_till")
 
-            params: dict = {"page": page}
-            if status:      params["status"] = status
-            if date_from:   params["date_from"] = date_from
-            if date_till:   params["date_till"] = date_till
-            if supplier_id: params["supplier_id"] = supplier_id
-            if reverse:     params["reverse"] = "true"
-            return format_response(get("purchases", params))
-        except Exception as e:
-            raise
+        params: dict = {"page": page}
+        if status:      params["status"] = status
+        if date_from:   params["date_from"] = date_from
+        if date_till:   params["date_till"] = date_till
+        if supplier_id: params["supplier_id"] = supplier_id
+        if reverse:     params["reverse"] = "true"
+        parsed = get("purchases", params)
+        return format_list(parse_list(parsed, page=page), response_format.value)
 
-    @mcp.tool()
-    def get_purchase(
-        document_id: Annotated[int, Field(
-            description="Numeric PayTraq purchase document ID.",
-            gt=0,
-        )],
+    @mcp.tool(
+        name="paytraq_get_purchase",
+        title="Get a purchase document",
+        annotations=READ_ONLY,
+    )
+    def paytraq_get_purchase(
+        document_id: Annotated[int, Field(gt=0, description="Purchase DocumentID.")],
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
-        """
-        Get full details of a purchase document (vendor invoice or order) by ID.
+        """Return full purchase document: line items, totals, supplier, payment status."""
+        parsed = get(f"purchase/{document_id}")
+        return format_single(parsed, response_format.value)
 
-        Use this tool to see line items, amounts, supplier details, and payment
-        status for a specific purchase document.
-        """
-        try:
-            return format_response(get(f"purchase/{document_id}"))
-        except Exception as e:
-            raise
-
-    @mcp.tool()
-    def create_purchase(
-        supplier_id: Annotated[int, Field(
-            description="PayTraq supplier ID. Use list_suppliers to find it.",
-            gt=0,
-        )],
-        document_date: Annotated[str, Field(
-            description="Document date in YYYY-MM-DD format.",
-        )],
-        currency: Annotated[str, Field(
-            default="EUR",
-            description="ISO 4217 currency code (e.g. EUR, USD).",
-        )] = "EUR",
+    @mcp.tool(
+        name="paytraq_create_purchase",
+        title="Create a purchase document",
+        annotations=WRITE_ADDITIVE,
+    )
+    def paytraq_create_purchase(
+        supplier_id: Annotated[int, Field(gt=0, description="SupplierID.")],
+        document_date: Annotated[str, Field(description="Document date (YYYY-MM-DD).")],
+        currency: Annotated[str, Field(description="ISO 4217 (EUR, USD, ...).")] = "EUR",
         items: Annotated[Optional[list], Field(
-            default=None,
             description=(
-                "Line items list. Each item is a dict with keys: "
-                "ItemID (int), Qty (float), Price (float). "
-                "Example: [{\"ItemID\": 10, \"Qty\": 5, \"Price\": 25.00}]"
+                "Line items — list of dicts with keys ItemID / Qty / Price. "
+                'Example: [{"ItemID": 10, "Qty": 5, "Price": 25.00}]'
             ),
         )] = None,
         ref_number: Annotated[Optional[str], Field(
-            default=None,
-            description="Supplier's invoice reference number.",
+            description="Supplier's invoice reference.",
         )] = None,
         due_date: Annotated[Optional[str], Field(
-            default=None,
-            description="Payment due date in YYYY-MM-DD format.",
+            description="Payment due date (YYYY-MM-DD).",
         )] = None,
-        comment: Annotated[Optional[str], Field(
-            default=None,
-            description="Internal notes about this purchase.",
-        )] = None,
+        comment: Annotated[Optional[str], Field(description="Internal notes.")] = None,
         warehouse_id: Annotated[Optional[int], Field(
-            default=None,
-            description="Destination warehouse ID for received goods.",
-            gt=0,
+            gt=0, description="Destination WarehouseID for received goods.",
         )] = None,
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
         """
-        Create a new purchase document (vendor invoice or purchase order) in PayTraq.
+        Create a purchase document (vendor invoice / PO) and return its DocumentID.
 
-        Use this tool when recording an invoice received from a supplier.
-        After creation, use approve_purchase and post_purchase to complete the
-        accounting workflow, then record_purchase_payment when you pay the vendor.
+        Workflow: paytraq_create_purchase → paytraq_approve_purchase →
+        paytraq_post_purchase → paytraq_record_purchase_payment.
         """
-        try:
-            err = _validate_date(document_date, "document_date")
-            if err:
-                return f"Error: {err}"
-            err = _validate_date(due_date, "due_date")
-            if err:
-                return f"Error: {err}"
+        ensure_date(document_date, "document_date")
+        ensure_date(due_date, "due_date")
+        currency = ensure_currency(currency) or "EUR"
+        line_items = _normalise_line_items(items)
 
-            data: dict = {
-                "SupplierID": supplier_id,
-                "DocumentDate": document_date,
-                "Currency": currency.upper(),
-            }
-            if ref_number:   data["DocumentRef"] = ref_number
-            if due_date:     data["DueDate"] = due_date
-            if comment:      data["Comment"] = comment
-            if warehouse_id: data["WarehouseID"] = warehouse_id
-            if items:        data["LineItems"] = {"LineItem": items}
+        data: dict[str, Any] = drop_none({
+            "SupplierID": supplier_id,
+            "DocumentDate": document_date,
+            "Currency": currency,
+            "DocumentRef": ref_number,
+            "DueDate": due_date,
+            "Comment": comment,
+            "WarehouseID": warehouse_id,
+        })
+        if line_items:
+            data["LineItems"] = {"LineItem": line_items}
 
-            return format_response(post("purchases", data, "Document"))
-        except Exception as e:
-            raise
+        parsed = post("purchases", data, "Document")
+        return format_single(parsed, response_format.value)
 
-    @mcp.tool()
-    def approve_purchase(
-        document_id: Annotated[int, Field(
-            description="ID of the purchase document to approve.",
-            gt=0,
-        )],
+    @mcp.tool(
+        name="paytraq_approve_purchase",
+        title="Approve a purchase document",
+        annotations=WRITE_IDEMPOTENT,
+    )
+    def paytraq_approve_purchase(
+        document_id: Annotated[int, Field(gt=0, description="Purchase DocumentID.")],
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
-        """
-        Approve a purchase document, moving it from 'draft' to 'approved' status.
+        """Move a purchase document from 'draft' to 'approved'."""
+        parsed = post(f"purchase/{document_id}/approve", {}, "Document")
+        return format_single(parsed, response_format.value)
 
-        Use this tool after reviewing a vendor invoice draft before posting it
-        to the accounting ledger.
-        """
-        try:
-            return format_response(post(f"purchase/{document_id}/approve", {}, "Document"))
-        except Exception as e:
-            raise
-
-    @mcp.tool()
-    def post_purchase(
-        document_id: Annotated[int, Field(
-            description="ID of the purchase document to post to accounting.",
-            gt=0,
-        )],
+    @mcp.tool(
+        name="paytraq_post_purchase",
+        title="Post a purchase to the ledger",
+        annotations=WRITE_IDEMPOTENT,
+    )
+    def paytraq_post_purchase(
+        document_id: Annotated[int, Field(gt=0, description="Purchase DocumentID.")],
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
-        """
-        Post a purchase document to the accounting ledger ('posted' status).
+        """Post an approved purchase document, creating the corresponding journal entries."""
+        parsed = post(f"purchase/{document_id}/post", {}, "Document")
+        return format_single(parsed, response_format.value)
 
-        Use this tool after approving a vendor invoice to create the corresponding
-        journal entries in the general ledger.
-        """
-        try:
-            return format_response(post(f"purchase/{document_id}/post", {}, "Document"))
-        except Exception as e:
-            raise
-
-    @mcp.tool()
-    def record_purchase_payment(
-        document_id: Annotated[int, Field(
-            description="ID of the purchase document being paid.",
-            gt=0,
-        )],
+    @mcp.tool(
+        name="paytraq_record_purchase_payment",
+        title="Record a payment to a supplier",
+        annotations=WRITE_ADDITIVE,
+    )
+    def paytraq_record_purchase_payment(
+        document_id: Annotated[int, Field(gt=0, description="Purchase DocumentID being paid.")],
         amount: Annotated[float, Field(
-            description="Payment amount. Use dot as decimal separator (e.g. 500.00).",
-            gt=0,
+            gt=0, description="Payment amount (e.g. 500.00).",
         )],
         payment_date: Annotated[str, Field(
-            description="Date the payment was sent, in YYYY-MM-DD format.",
+            description="Date payment was sent (YYYY-MM-DD).",
         )],
         comment: Annotated[Optional[str], Field(
-            default=None,
             description="Internal note (e.g. bank transfer reference).",
         )] = None,
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
-        """
-        Record a payment made to a supplier for a purchase document.
+        """Record a payment made to a supplier. Multiple calls allowed for partial payments."""
+        ensure_date(payment_date, "payment_date")
+        data = drop_none({
+            "Amount": amount,
+            "PaymentDate": payment_date,
+            "Comment": comment,
+        })
+        parsed = post(f"purchase/{document_id}/payment", data, "Payment")
+        return format_single(parsed, response_format.value)
 
-        Use this tool when you have paid a vendor invoice. For partial payments,
-        call this tool multiple times with the respective partial amounts.
-        """
-        try:
-            err = _validate_date(payment_date, "payment_date")
-            if err:
-                return f"Error: {err}"
+    # ── Payments & attachments ────────────────────────────────────────────────
 
-            data: dict = {"Amount": amount, "PaymentDate": payment_date}
-            if comment: data["Comment"] = comment
-            return format_response(post(f"purchase/{document_id}/payment", data, "Payment"))
-        except Exception as e:
-            raise
-
-    # ── PAYMENTS ──────────────────────────────────────────────────────────────
-
-    @mcp.tool()
-    def list_payments(
-        date_from: Annotated[Optional[str], Field(
-            default=None,
-            description="Start date filter in YYYY-MM-DD format.",
-        )] = None,
-        date_till: Annotated[Optional[str], Field(
-            default=None,
-            description="End date filter in YYYY-MM-DD format.",
-        )] = None,
-        page: Annotated[int, Field(
-            default=0,
-            ge=0,
-            description="Page number (100 records per page).",
-        )] = 0,
+    @mcp.tool(
+        name="paytraq_list_payments",
+        title="List payments",
+        annotations=READ_ONLY,
+    )
+    def paytraq_list_payments(
+        date_from: Annotated[Optional[str], Field(description="Start date (YYYY-MM-DD).")] = None,
+        date_till: Annotated[Optional[str], Field(description="End date (YYYY-MM-DD).")] = None,
+        page: Annotated[int, Field(ge=0, description="0-indexed page (100/page).")] = 0,
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
-        """
-        List all payment records (both received from clients and sent to suppliers).
+        """List all payment records (received from clients and sent to suppliers)."""
+        ensure_date(date_from, "date_from")
+        ensure_date(date_till, "date_till")
 
-        Use this tool when you need a cash-flow view of all money movements,
-        or to reconcile bank statements with PayTraq payment records.
-        """
-        try:
-            for val, name in [(date_from, "date_from"), (date_till, "date_till")]:
-                err = _validate_date(val, name)
-                if err:
-                    return f"Error: {err}"
+        params: dict = {"page": page}
+        if date_from: params["date_from"] = date_from
+        if date_till: params["date_till"] = date_till
+        parsed = get("payments", params)
+        return format_list(parse_list(parsed, page=page), response_format.value)
 
-            params: dict = {"page": page}
-            if date_from: params["date_from"] = date_from
-            if date_till: params["date_till"] = date_till
-            return format_response(get("payments", params))
-        except Exception as e:
-            raise
-
-    @mcp.tool()
-    def get_payment(
-        payment_id: Annotated[int, Field(
-            description="Numeric PayTraq payment ID.",
-            gt=0,
-        )],
+    @mcp.tool(
+        name="paytraq_get_payment",
+        title="Get a payment",
+        annotations=READ_ONLY,
+    )
+    def paytraq_get_payment(
+        payment_id: Annotated[int, Field(gt=0, description="Numeric PaymentID.")],
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
-        """
-        Get full details of a payment record by ID.
+        """Return full payment record: amount, date, method, linked document."""
+        parsed = get(f"payment/{payment_id}")
+        return format_single(parsed, response_format.value)
 
-        Use this tool when you need to verify the amount, date, method, and
-        linked document for a specific payment transaction.
-        """
-        try:
-            return format_response(get(f"payment/{payment_id}"))
-        except Exception as e:
-            raise
-
-    # ── ATTACHMENTS ───────────────────────────────────────────────────────────
-
-    @mcp.tool()
-    def list_attachments(
+    @mcp.tool(
+        name="paytraq_list_attachments",
+        title="List document attachments",
+        annotations=READ_ONLY,
+    )
+    def paytraq_list_attachments(
         document_id: Annotated[int, Field(
-            description=(
-                "ID of the sales or purchase document whose attachments to list."
-            ),
-            gt=0,
+            gt=0, description="Sales or purchase DocumentID.",
         )],
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
-        """
-        List all file attachments on a sales or purchase document.
-
-        Use this tool when you need to check whether a document has scanned
-        invoices, receipts, or other supporting files attached.
-        """
-        try:
-            return format_response(get(f"attachments/{document_id}"))
-        except Exception as e:
-            raise
+        """List file attachments on a document (scanned invoices, receipts, contracts)."""
+        parsed = get(f"attachments/{document_id}")
+        result = parse_list(parsed, page=0)
+        return format_list(result, response_format.value)

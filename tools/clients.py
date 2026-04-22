@@ -1,652 +1,513 @@
 """
-PayTraq MCP — Clients, Suppliers & Employees Tools
-----------------------------------------------------
-Tools for managing clients (customers), suppliers (vendors), and employees
-in PayTraq.
+PayTraq MCP — Clients (customers), Suppliers (vendors), and Employees.
 
-When to use these tools:
-  - list_clients / get_client: look up customer information, find client IDs
-  - create_client / update_client: onboard new customers or update their data
-  - get_client_outstanding: check how much a customer owes
-  - list_suppliers / create_supplier: manage vendor/supplier records
-  - list_employees / create_employee: manage employee directory
+CRUD operations on the three types of business partner records PayTraq tracks.
+Client = customer you invoice; Supplier = vendor you pay; Employee = internal
+staff assigned to documents.
 """
 
-import re
+from __future__ import annotations
+
 from typing import Annotated, Optional
-from pydantic import Field
+
 from mcp.server.fastmcp import FastMCP
-from paytraq_client import get, post, format_response
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
-# Regex for basic email validation
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-# Regex for 2-letter ISO country code
-_COUNTRY_RE = re.compile(r"^[A-Z]{2}$")
-# Regex for ISO 4217 currency code
-_CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
+from paytraq_client import (
+    PaytraqBadRequest,
+    format_list,
+    format_single,
+    get,
+    parse_list,
+    post,
+)
+from tools._common import (
+    ResponseFormat,
+    drop_none,
+    ensure_country,
+    ensure_currency,
+    ensure_email,
+)
 
 
-def _validate_country(country: Optional[str]) -> Optional[str]:
-    if country and not _COUNTRY_RE.match(country.upper()):
-        return f"Invalid country code '{country}'. Use 2-letter ISO code (e.g. LV, EE, LT, DE)."
-    return None
-
-
-def _validate_currency(currency: Optional[str]) -> Optional[str]:
-    if currency and not _CURRENCY_RE.match(currency.upper()):
-        return f"Invalid currency code '{currency}'. Use 3-letter ISO 4217 code (e.g. EUR, USD, GBP)."
-    return None
+READ_ONLY = ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+)
+WRITE_ADDITIVE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True
+)
+WRITE_UPDATE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True
+)
 
 
 def register(mcp: FastMCP) -> None:
 
-    # ── CLIENTS ───────────────────────────────────────────────────────────────
+    # ── Clients ───────────────────────────────────────────────────────────────
 
-    @mcp.tool()
-    def list_clients(
+    @mcp.tool(
+        name="paytraq_list_clients",
+        title="List clients (customers)",
+        annotations=READ_ONLY,
+    )
+    def paytraq_list_clients(
         query: Annotated[Optional[str], Field(
-            default=None,
-            description="Filter by client name or email. Leave empty to list all clients."
+            description="Filter by client name or email. Omit to list all.",
         )] = None,
         page: Annotated[int, Field(
-            default=0,
-            ge=0,
-            description="Page number for pagination (100 records per page, starting at 0)."
+            ge=0, description="0-indexed page (100 records per page).",
         )] = 0,
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
         """
-        List all clients (customers) in PayTraq, optionally filtering by name or email.
+        List clients (customers), optionally filtered by name/email.
 
-        Use this tool when you need to:
-        - Find a client's ID before creating an invoice or payment
-        - Browse all customers in the system
-        - Search for a specific customer by name
+        Use this to find a ClientID before creating an invoice, recording a
+        payment, or looking up outstanding balances.
         """
-        try:
-            params = {"page": page}
-            if query:
-                params["query"] = query
-            return format_response(get("clients", params))
-        except Exception as e:
-            raise
+        params: dict = {"page": page}
+        if query:
+            params["query"] = query
+        parsed = get("clients", params)
+        return format_list(parse_list(parsed, page=page), response_format.value)
 
-    @mcp.tool()
-    def get_client(
-        client_id: Annotated[int, Field(
-            description="Numeric PayTraq client ID. Use list_clients to find it.",
-            gt=0,
-        )],
+    @mcp.tool(
+        name="paytraq_get_client",
+        title="Get client details",
+        annotations=READ_ONLY,
+    )
+    def paytraq_get_client(
+        client_id: Annotated[int, Field(gt=0, description="Numeric PayTraq ClientID.")],
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
         """
-        Get full details of a single client by their PayTraq ID.
-
-        Use this tool when you need the complete client record including address,
-        VAT number, currency, and contact details.
+        Retrieve the full client record: address, VAT number, currency, contacts.
+        Use when you need more detail than the listing provides.
         """
-        try:
-            return format_response(get(f"client/{client_id}"))
-        except Exception as e:
-            raise
+        parsed = get(f"client/{client_id}")
+        return format_single(parsed, response_format.value)
 
-    @mcp.tool()
-    def create_client(
-        name: Annotated[str, Field(description="Full name or company name of the client.")],
+    @mcp.tool(
+        name="paytraq_create_client",
+        title="Create a client",
+        annotations=WRITE_ADDITIVE,
+    )
+    def paytraq_create_client(
+        name: Annotated[str, Field(min_length=1, description="Full name or company name.")],
         email: Annotated[Optional[str], Field(
-            default=None,
-            description="Email address for invoicing and communication."
+            description="Email for invoicing/communication.",
         )] = None,
         phone: Annotated[Optional[str], Field(
-            default=None,
-            description="Phone number including country code."
+            description="Phone number including country code.",
         )] = None,
         reg_number: Annotated[Optional[str], Field(
-            default=None,
-            description="Company registration number."
+            description="Company registration number.",
         )] = None,
         vat_number: Annotated[Optional[str], Field(
-            default=None,
-            description="VAT (PVN) registration number."
+            description="VAT registration number (e.g. LV40003...).",
         )] = None,
         country: Annotated[Optional[str], Field(
-            default=None,
-            description="2-letter ISO country code (e.g. LV, EE, LT, DE)."
+            description="2-letter ISO 3166-1 alpha-2 country code (LV, EE, DE...).",
         )] = None,
-        address: Annotated[Optional[str], Field(
-            default=None,
-            description="Street address."
-        )] = None,
-        city: Annotated[Optional[str], Field(
-            default=None,
-            description="City name."
-        )] = None,
-        zip_code: Annotated[Optional[str], Field(
-            default=None,
-            description="Postal/ZIP code."
-        )] = None,
+        address: Annotated[Optional[str], Field(description="Street address.")] = None,
+        city: Annotated[Optional[str], Field(description="City.")] = None,
+        zip_code: Annotated[Optional[str], Field(description="Postal/ZIP code.")] = None,
         client_type: Annotated[int, Field(
-            default=2,
-            description="Client type: 1 = Individual (physical person), 2 = Company (legal entity).",
-            ge=1,
-            le=2,
+            ge=1, le=2,
+            description="1 = Individual (natural person), 2 = Company (legal entity).",
         )] = 2,
         currency: Annotated[Optional[str], Field(
-            default=None,
-            description="Default invoice currency, ISO 4217 code (e.g. EUR, USD)."
+            description="Default billing currency (ISO 4217: EUR, USD...).",
         )] = None,
         comment: Annotated[Optional[str], Field(
-            default=None,
-            description="Internal notes or comments about the client."
+            description="Internal-only notes about the client.",
         )] = None,
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
         """
-        Create a new client (customer) record in PayTraq.
+        Create a new client record and return its ClientID.
 
-        Use this tool when onboarding a new customer before creating their first invoice.
-        After creation, use the returned client ID for all subsequent documents.
+        Typical flow: call this before issuing the first invoice to a new
+        customer. The returned ClientID is required by paytraq_create_sale.
         """
-        try:
-            if email and not _EMAIL_RE.match(email):
-                return f"Error: Invalid email address '{email}'."
-            if country:
-                err = _validate_country(country)
-                if err:
-                    return f"Error: {err}"
-                country = country.upper()
-            if currency:
-                err = _validate_currency(currency)
-                if err:
-                    return f"Error: {err}"
-                currency = currency.upper()
+        email = ensure_email(email)
+        country = ensure_country(country)
+        currency = ensure_currency(currency)
 
-            data: dict = {"Name": name, "Type": client_type}
-            if email:       data["Email"] = email
-            if phone:       data["Phone"] = phone
-            if reg_number:  data["RegNumber"] = reg_number
-            if vat_number:  data["VatNumber"] = vat_number
-            if country:     data["Country"] = country
-            if address:     data["Address"] = address
-            if city:        data["City"] = city
-            if zip_code:    data["Zip"] = zip_code
-            if currency:    data["Currency"] = currency
-            if comment:     data["Comment"] = comment
-            return format_response(post("client", data, "Client"))
-        except Exception as e:
-            raise
+        data = drop_none({
+            "Name": name,
+            "Type": client_type,
+            "Email": email,
+            "Phone": phone,
+            "RegNumber": reg_number,
+            "VatNumber": vat_number,
+            "Country": country,
+            "Address": address,
+            "City": city,
+            "Zip": zip_code,
+            "Currency": currency,
+            "Comment": comment,
+        })
+        parsed = post("client", data, "Client")
+        return format_single(parsed, response_format.value)
 
-    @mcp.tool()
-    def update_client(
-        client_id: Annotated[int, Field(
-            description="ID of the client to update. Use list_clients to find it.",
-            gt=0,
-        )],
-        name: Annotated[Optional[str], Field(
-            default=None,
-            description="New full name or company name."
-        )] = None,
-        email: Annotated[Optional[str], Field(
-            default=None,
-            description="New email address."
-        )] = None,
-        phone: Annotated[Optional[str], Field(
-            default=None,
-            description="New phone number."
-        )] = None,
-        reg_number: Annotated[Optional[str], Field(
-            default=None,
-            description="Updated company registration number."
-        )] = None,
-        vat_number: Annotated[Optional[str], Field(
-            default=None,
-            description="Updated VAT registration number."
-        )] = None,
-        country: Annotated[Optional[str], Field(
-            default=None,
-            description="2-letter ISO country code."
-        )] = None,
-        address: Annotated[Optional[str], Field(
-            default=None,
-            description="Updated street address."
-        )] = None,
-        city: Annotated[Optional[str], Field(
-            default=None,
-            description="Updated city."
-        )] = None,
-        zip_code: Annotated[Optional[str], Field(
-            default=None,
-            description="Updated postal/ZIP code."
-        )] = None,
-        comment: Annotated[Optional[str], Field(
-            default=None,
-            description="Updated internal notes."
-        )] = None,
+    @mcp.tool(
+        name="paytraq_update_client",
+        title="Update a client",
+        annotations=WRITE_UPDATE,
+    )
+    def paytraq_update_client(
+        client_id: Annotated[int, Field(gt=0, description="ClientID to update.")],
+        name: Annotated[Optional[str], Field(description="New name.")] = None,
+        email: Annotated[Optional[str], Field(description="New email.")] = None,
+        phone: Annotated[Optional[str], Field(description="New phone.")] = None,
+        reg_number: Annotated[Optional[str], Field(description="New registration number.")] = None,
+        vat_number: Annotated[Optional[str], Field(description="New VAT number.")] = None,
+        country: Annotated[Optional[str], Field(description="New 2-letter country code.")] = None,
+        address: Annotated[Optional[str], Field(description="New street address.")] = None,
+        city: Annotated[Optional[str], Field(description="New city.")] = None,
+        zip_code: Annotated[Optional[str], Field(description="New postal code.")] = None,
+        comment: Annotated[Optional[str], Field(description="New internal notes.")] = None,
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
         """
-        Update fields on an existing client record in PayTraq.
+        Update one or more fields on an existing client. Omitted fields are preserved.
 
-        Use this tool when a customer's address, contact info, or VAT number has changed.
-        Only the fields you provide will be updated — omitted fields are left unchanged.
+        Provide at least one field to change; empty update requests are rejected
+        so you don't accidentally wipe data.
         """
-        try:
-            if email and not _EMAIL_RE.match(email):
-                return f"Error: Invalid email address '{email}'."
-            if country:
-                err = _validate_country(country)
-                if err:
-                    return f"Error: {err}"
-                country = country.upper()
+        email = ensure_email(email)
+        country = ensure_country(country)
 
-            data: dict = {}
-            if name:        data["Name"] = name
-            if email:       data["Email"] = email
-            if phone:       data["Phone"] = phone
-            if reg_number:  data["RegNumber"] = reg_number
-            if vat_number:  data["VatNumber"] = vat_number
-            if country:     data["Country"] = country
-            if address:     data["Address"] = address
-            if city:        data["City"] = city
-            if zip_code:    data["Zip"] = zip_code
-            if comment:     data["Comment"] = comment
-            if not data:
-                return "Error: Provide at least one field to update."
-            return format_response(post(f"client/{client_id}", data, "Client"))
-        except Exception as e:
-            raise
+        data = drop_none({
+            "Name": name,
+            "Email": email,
+            "Phone": phone,
+            "RegNumber": reg_number,
+            "VatNumber": vat_number,
+            "Country": country,
+            "Address": address,
+            "City": city,
+            "Zip": zip_code,
+            "Comment": comment,
+        })
+        if not data:
+            raise PaytraqBadRequest(
+                "No fields supplied — pass at least one of name/email/phone/... to update."
+            )
+        parsed = post(f"client/{client_id}", data, "Client")
+        return format_single(parsed, response_format.value)
 
-    @mcp.tool()
-    def get_client_outstanding(
-        client_id: Annotated[int, Field(
-            description="Client ID to check outstanding balance for.",
-            gt=0,
-        )],
+    @mcp.tool(
+        name="paytraq_get_client_outstanding",
+        title="Get client outstanding balance",
+        annotations=READ_ONLY,
+    )
+    def paytraq_get_client_outstanding(
+        client_id: Annotated[int, Field(gt=0, description="ClientID to check.")],
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
         """
-        Get a client's outstanding balance — all unpaid invoices and total amount owed.
+        Return a client's unpaid invoices and total amount owed.
 
-        Use this tool when you need to know:
-        - How much a customer owes in total
-        - Which specific invoices are unpaid
-        - Whether it's safe to extend more credit to a customer
+        Use before extending credit, sending reminders, or answering 'how much
+        does customer X owe us?'.
         """
-        try:
-            return format_response(get(f"client/outstanding/{client_id}"))
-        except Exception as e:
-            raise
+        parsed = get(f"client/outstanding/{client_id}")
+        return format_single(parsed, response_format.value)
 
-    @mcp.tool()
-    def list_client_contacts(
-        client_id: Annotated[int, Field(
-            description="Client ID whose contacts to list.",
-            gt=0,
-        )],
+    @mcp.tool(
+        name="paytraq_list_client_contacts",
+        title="List contacts of a client",
+        annotations=READ_ONLY,
+    )
+    def paytraq_list_client_contacts(
+        client_id: Annotated[int, Field(gt=0, description="ClientID.")],
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
-        """
-        List all contact persons associated with a client.
+        """List contact persons associated with a client (AP, procurement, etc.)."""
+        parsed = get(f"client/contacts/{client_id}")
+        result = parse_list(parsed, page=0)
+        return format_list(result, response_format.value)
 
-        Use this tool when you need to find the right contact person at a company
-        for sending invoices or making calls.
-        """
-        try:
-            return format_response(get(f"client/contacts/{client_id}"))
-        except Exception as e:
-            raise
-
-    @mcp.tool()
-    def add_client_contact(
-        client_id: Annotated[int, Field(
-            description="Client ID to add a contact to.",
-            gt=0,
-        )],
-        name: Annotated[str, Field(description="Full name of the contact person.")],
-        email: Annotated[Optional[str], Field(
-            default=None,
-            description="Contact person's email address."
-        )] = None,
-        phone: Annotated[Optional[str], Field(
-            default=None,
-            description="Contact person's phone number."
-        )] = None,
+    @mcp.tool(
+        name="paytraq_add_client_contact",
+        title="Add a contact to a client",
+        annotations=WRITE_ADDITIVE,
+    )
+    def paytraq_add_client_contact(
+        client_id: Annotated[int, Field(gt=0, description="ClientID to attach to.")],
+        name: Annotated[str, Field(min_length=1, description="Contact person's full name.")],
+        email: Annotated[Optional[str], Field(description="Contact email.")] = None,
+        phone: Annotated[Optional[str], Field(description="Contact phone.")] = None,
         position: Annotated[Optional[str], Field(
-            default=None,
-            description="Job title or position of the contact (e.g. 'CFO', 'Accountant')."
+            description="Job title (e.g. 'CFO', 'Accountant').",
         )] = None,
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
-        """
-        Add a new contact person to an existing client record.
+        """Attach a new contact person to an existing client."""
+        email = ensure_email(email)
+        data = drop_none({
+            "Name": name, "Email": email, "Phone": phone, "Position": position,
+        })
+        parsed = post(f"client/contact/{client_id}", data, "Contact")
+        return format_single(parsed, response_format.value)
 
-        Use this tool when a company has multiple contacts and you need to
-        record a new person (e.g. new accountant, new purchasing manager).
-        """
-        try:
-            if email and not _EMAIL_RE.match(email):
-                return f"Error: Invalid email address '{email}'."
-            data: dict = {"Name": name}
-            if email:    data["Email"] = email
-            if phone:    data["Phone"] = phone
-            if position: data["Position"] = position
-            return format_response(post(f"client/contact/{client_id}", data, "Contact"))
-        except Exception as e:
-            raise
-
-    @mcp.tool()
-    def list_client_banks(
-        client_id: Annotated[int, Field(
-            description="Client ID whose bank accounts to list.",
-            gt=0,
-        )],
+    @mcp.tool(
+        name="paytraq_list_client_banks",
+        title="List client bank accounts",
+        annotations=READ_ONLY,
+    )
+    def paytraq_list_client_banks(
+        client_id: Annotated[int, Field(gt=0, description="ClientID.")],
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
-        """
-        Get bank account details for a client (IBAN, BIC/SWIFT, bank name).
+        """Return IBAN / BIC / bank name for a client's bank accounts."""
+        parsed = get(f"client/banks/{client_id}")
+        result = parse_list(parsed, page=0)
+        return format_list(result, response_format.value)
 
-        Use this tool when you need to verify or retrieve a client's bank details
-        before initiating a payment or refund.
-        """
-        try:
-            return format_response(get(f"client/banks/{client_id}"))
-        except Exception as e:
-            raise
+    @mcp.tool(
+        name="paytraq_list_client_groups",
+        title="List client groups",
+        annotations=READ_ONLY,
+    )
+    def paytraq_list_client_groups(
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
+    ) -> str:
+        """List configured client groups (categories/segments)."""
+        parsed = get("clientGroups")
+        result = parse_list(parsed, page=0)
+        return format_list(result, response_format.value)
 
-    @mcp.tool()
-    def list_client_groups() -> str:
-        """
-        List all client groups (categories) defined in PayTraq.
+    # ── Suppliers ─────────────────────────────────────────────────────────────
 
-        Use this tool when you need group IDs for filtering or when setting up
-        a new client that belongs to an existing group.
-        """
-        try:
-            return format_response(get("clientGroups"))
-        except Exception as e:
-            raise
-
-    # ── SUPPLIERS ─────────────────────────────────────────────────────────────
-
-    @mcp.tool()
-    def list_suppliers(
+    @mcp.tool(
+        name="paytraq_list_suppliers",
+        title="List suppliers (vendors)",
+        annotations=READ_ONLY,
+    )
+    def paytraq_list_suppliers(
         query: Annotated[Optional[str], Field(
-            default=None,
-            description="Filter by supplier name or email."
+            description="Filter by supplier name or email.",
         )] = None,
-        page: Annotated[int, Field(
-            default=0,
-            ge=0,
-            description="Page number (100 records per page, starting at 0)."
-        )] = 0,
+        page: Annotated[int, Field(ge=0, description="0-indexed page (100/page).")] = 0,
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
-        """
-        List all suppliers (vendors) in PayTraq.
+        """List suppliers. Use to find a SupplierID before creating a purchase."""
+        params: dict = {"page": page}
+        if query:
+            params["query"] = query
+        parsed = get("suppliers", params)
+        return format_list(parse_list(parsed, page=page), response_format.value)
 
-        Use this tool when you need to find a supplier ID before creating a
-        purchase order or recording a vendor invoice.
-        """
-        try:
-            params = {"page": page}
-            if query:
-                params["query"] = query
-            return format_response(get("suppliers", params))
-        except Exception as e:
-            raise
-
-    @mcp.tool()
-    def get_supplier(
-        supplier_id: Annotated[int, Field(
-            description="Numeric PayTraq supplier ID.",
-            gt=0,
-        )],
+    @mcp.tool(
+        name="paytraq_get_supplier",
+        title="Get supplier details",
+        annotations=READ_ONLY,
+    )
+    def paytraq_get_supplier(
+        supplier_id: Annotated[int, Field(gt=0, description="Numeric SupplierID.")],
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
-        """
-        Get full details of a supplier record by ID.
+        """Return full supplier record: registration, VAT, address, bank details."""
+        parsed = get(f"supplier/{supplier_id}")
+        return format_single(parsed, response_format.value)
 
-        Use this tool to retrieve a supplier's registration, VAT, address, and
-        bank details before creating purchase documents.
-        """
-        try:
-            return format_response(get(f"supplier/{supplier_id}"))
-        except Exception as e:
-            raise
-
-    @mcp.tool()
-    def create_supplier(
-        name: Annotated[str, Field(description="Supplier company name.")],
-        email: Annotated[Optional[str], Field(
-            default=None,
-            description="Supplier's email address."
-        )] = None,
-        phone: Annotated[Optional[str], Field(
-            default=None,
-            description="Supplier's phone number."
-        )] = None,
-        reg_number: Annotated[Optional[str], Field(
-            default=None,
-            description="Supplier's company registration number."
-        )] = None,
-        vat_number: Annotated[Optional[str], Field(
-            default=None,
-            description="Supplier's VAT registration number."
-        )] = None,
-        country: Annotated[Optional[str], Field(
-            default=None,
-            description="2-letter ISO country code (e.g. LV, EE, LT, DE)."
-        )] = None,
-        address: Annotated[Optional[str], Field(
-            default=None,
-            description="Supplier's street address."
-        )] = None,
-        currency: Annotated[Optional[str], Field(
-            default=None,
-            description="Default purchase currency, ISO 4217 (e.g. EUR, USD)."
-        )] = None,
-        comment: Annotated[Optional[str], Field(
-            default=None,
-            description="Internal notes about this supplier."
-        )] = None,
+    @mcp.tool(
+        name="paytraq_create_supplier",
+        title="Create a supplier",
+        annotations=WRITE_ADDITIVE,
+    )
+    def paytraq_create_supplier(
+        name: Annotated[str, Field(min_length=1, description="Supplier company name.")],
+        email: Annotated[Optional[str], Field(description="Supplier email.")] = None,
+        phone: Annotated[Optional[str], Field(description="Supplier phone.")] = None,
+        reg_number: Annotated[Optional[str], Field(description="Company registration number.")] = None,
+        vat_number: Annotated[Optional[str], Field(description="VAT number.")] = None,
+        country: Annotated[Optional[str], Field(description="2-letter ISO country code.")] = None,
+        address: Annotated[Optional[str], Field(description="Street address.")] = None,
+        currency: Annotated[Optional[str], Field(description="ISO 4217 default purchase currency.")] = None,
+        comment: Annotated[Optional[str], Field(description="Internal notes.")] = None,
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
-        """
-        Create a new supplier (vendor) record in PayTraq.
+        """Create a supplier record. Call before the first purchase from a new vendor."""
+        email = ensure_email(email)
+        country = ensure_country(country)
+        currency = ensure_currency(currency)
 
-        Use this tool before creating the first purchase order for a new vendor.
-        """
-        try:
-            if email and not _EMAIL_RE.match(email):
-                return f"Error: Invalid email address '{email}'."
-            if country:
-                err = _validate_country(country)
-                if err:
-                    return f"Error: {err}"
-                country = country.upper()
-            if currency:
-                err = _validate_currency(currency)
-                if err:
-                    return f"Error: {err}"
-                currency = currency.upper()
+        data = drop_none({
+            "Name": name,
+            "Email": email,
+            "Phone": phone,
+            "RegNumber": reg_number,
+            "VatNumber": vat_number,
+            "Country": country,
+            "Address": address,
+            "Currency": currency,
+            "Comment": comment,
+        })
+        parsed = post("supplier", data, "Supplier")
+        return format_single(parsed, response_format.value)
 
-            data: dict = {"Name": name}
-            if email:       data["Email"] = email
-            if phone:       data["Phone"] = phone
-            if reg_number:  data["RegNumber"] = reg_number
-            if vat_number:  data["VatNumber"] = vat_number
-            if country:     data["Country"] = country
-            if address:     data["Address"] = address
-            if currency:    data["Currency"] = currency
-            if comment:     data["Comment"] = comment
-            return format_response(post("supplier", data, "Supplier"))
-        except Exception as e:
-            raise
-
-    @mcp.tool()
-    def update_supplier(
-        supplier_id: Annotated[int, Field(
-            description="ID of the supplier to update.",
-            gt=0,
-        )],
-        name: Annotated[Optional[str], Field(
-            default=None,
-            description="New supplier name."
-        )] = None,
-        email: Annotated[Optional[str], Field(
-            default=None,
-            description="New email address."
-        )] = None,
-        phone: Annotated[Optional[str], Field(
-            default=None,
-            description="New phone number."
-        )] = None,
-        reg_number: Annotated[Optional[str], Field(
-            default=None,
-            description="Updated registration number."
-        )] = None,
-        vat_number: Annotated[Optional[str], Field(
-            default=None,
-            description="Updated VAT number."
-        )] = None,
-        country: Annotated[Optional[str], Field(
-            default=None,
-            description="2-letter ISO country code."
-        )] = None,
-        address: Annotated[Optional[str], Field(
-            default=None,
-            description="Updated address."
-        )] = None,
-        comment: Annotated[Optional[str], Field(
-            default=None,
-            description="Updated internal notes."
-        )] = None,
+    @mcp.tool(
+        name="paytraq_update_supplier",
+        title="Update a supplier",
+        annotations=WRITE_UPDATE,
+    )
+    def paytraq_update_supplier(
+        supplier_id: Annotated[int, Field(gt=0, description="SupplierID to update.")],
+        name: Annotated[Optional[str], Field(description="New name.")] = None,
+        email: Annotated[Optional[str], Field(description="New email.")] = None,
+        phone: Annotated[Optional[str], Field(description="New phone.")] = None,
+        reg_number: Annotated[Optional[str], Field(description="New registration number.")] = None,
+        vat_number: Annotated[Optional[str], Field(description="New VAT number.")] = None,
+        country: Annotated[Optional[str], Field(description="New country code.")] = None,
+        address: Annotated[Optional[str], Field(description="New address.")] = None,
+        comment: Annotated[Optional[str], Field(description="New internal notes.")] = None,
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
-        """
-        Update fields on an existing supplier record.
+        """Update fields on an existing supplier. Omitted fields unchanged."""
+        email = ensure_email(email)
+        country = ensure_country(country)
 
-        Use this tool when a supplier changes their address, VAT number, or
-        contact information. Only provided fields are updated.
-        """
-        try:
-            if email and not _EMAIL_RE.match(email):
-                return f"Error: Invalid email address '{email}'."
-            if country:
-                err = _validate_country(country)
-                if err:
-                    return f"Error: {err}"
-                country = country.upper()
+        data = drop_none({
+            "Name": name,
+            "Email": email,
+            "Phone": phone,
+            "RegNumber": reg_number,
+            "VatNumber": vat_number,
+            "Country": country,
+            "Address": address,
+            "Comment": comment,
+        })
+        if not data:
+            raise PaytraqBadRequest(
+                "No fields supplied — pass at least one of name/email/phone/... to update."
+            )
+        parsed = post(f"supplier/{supplier_id}", data, "Supplier")
+        return format_single(parsed, response_format.value)
 
-            data: dict = {}
-            if name:        data["Name"] = name
-            if email:       data["Email"] = email
-            if phone:       data["Phone"] = phone
-            if reg_number:  data["RegNumber"] = reg_number
-            if vat_number:  data["VatNumber"] = vat_number
-            if country:     data["Country"] = country
-            if address:     data["Address"] = address
-            if comment:     data["Comment"] = comment
-            if not data:
-                return "Error: Provide at least one field to update."
-            return format_response(post(f"supplier/{supplier_id}", data, "Supplier"))
-        except Exception as e:
-            raise
+    @mcp.tool(
+        name="paytraq_list_supplier_groups",
+        title="List supplier groups",
+        annotations=READ_ONLY,
+    )
+    def paytraq_list_supplier_groups(
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
+    ) -> str:
+        """List configured supplier groups (categories)."""
+        parsed = get("supplierGroups")
+        result = parse_list(parsed, page=0)
+        return format_list(result, response_format.value)
 
-    @mcp.tool()
-    def list_supplier_groups() -> str:
-        """
-        List all supplier groups (categories) defined in PayTraq.
+    # ── Employees ─────────────────────────────────────────────────────────────
 
-        Use this tool to get group IDs when filtering suppliers or when assigning
-        a new supplier to a group.
-        """
-        try:
-            return format_response(get("supplierGroups"))
-        except Exception as e:
-            raise
-
-    # ── EMPLOYEES ─────────────────────────────────────────────────────────────
-
-    @mcp.tool()
-    def list_employees(
+    @mcp.tool(
+        name="paytraq_list_employees",
+        title="List employees",
+        annotations=READ_ONLY,
+    )
+    def paytraq_list_employees(
         query: Annotated[Optional[str], Field(
-            default=None,
-            description="Filter by employee name."
+            description="Filter by employee name.",
         )] = None,
-        page: Annotated[int, Field(
-            default=0,
-            ge=0,
-            description="Page number (100 records per page, starting at 0)."
-        )] = 0,
+        page: Annotated[int, Field(ge=0, description="0-indexed page (100/page).")] = 0,
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
-        """
-        List all employees in PayTraq.
+        """List employees. Use to find EmployeeIDs when assigning them to documents."""
+        params: dict = {"page": page}
+        if query:
+            params["query"] = query
+        parsed = get("employees", params)
+        return format_list(parse_list(parsed, page=page), response_format.value)
 
-        Use this tool to find employee IDs when assigning employees to documents
-        or checking the employee directory.
-        """
-        try:
-            params = {"page": page}
-            if query:
-                params["query"] = query
-            return format_response(get("employees", params))
-        except Exception as e:
-            raise
-
-    @mcp.tool()
-    def get_employee(
-        employee_id: Annotated[int, Field(
-            description="Numeric PayTraq employee ID.",
-            gt=0,
-        )],
+    @mcp.tool(
+        name="paytraq_get_employee",
+        title="Get employee details",
+        annotations=READ_ONLY,
+    )
+    def paytraq_get_employee(
+        employee_id: Annotated[int, Field(gt=0, description="Numeric EmployeeID.")],
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
-        """
-        Get full details of an employee record by ID.
+        """Return full employee record: contact info, position, department."""
+        parsed = get(f"employee/{employee_id}")
+        return format_single(parsed, response_format.value)
 
-        Use this tool to retrieve an employee's contact info, position,
-        and other details.
-        """
-        try:
-            return format_response(get(f"employee/{employee_id}"))
-        except Exception as e:
-            raise
-
-    @mcp.tool()
-    def create_employee(
-        name: Annotated[str, Field(description="Employee's full name.")],
-        email: Annotated[Optional[str], Field(
-            default=None,
-            description="Employee's work email address."
-        )] = None,
-        phone: Annotated[Optional[str], Field(
-            default=None,
-            description="Employee's phone number."
-        )] = None,
+    @mcp.tool(
+        name="paytraq_create_employee",
+        title="Create an employee",
+        annotations=WRITE_ADDITIVE,
+    )
+    def paytraq_create_employee(
+        name: Annotated[str, Field(min_length=1, description="Employee full name.")],
+        email: Annotated[Optional[str], Field(description="Work email address.")] = None,
+        phone: Annotated[Optional[str], Field(description="Phone number.")] = None,
         position: Annotated[Optional[str], Field(
-            default=None,
-            description="Job title or position (e.g. 'Accountant', 'Sales Manager')."
+            description="Job title (e.g. 'Accountant', 'Sales Manager').",
         )] = None,
-        comment: Annotated[Optional[str], Field(
-            default=None,
-            description="Internal notes about the employee."
-        )] = None,
+        comment: Annotated[Optional[str], Field(description="Internal notes.")] = None,
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
     ) -> str:
-        """
-        Create a new employee record in PayTraq.
+        """Create a new employee record for the accounting system."""
+        email = ensure_email(email)
+        data = drop_none({
+            "Name": name,
+            "Email": email,
+            "Phone": phone,
+            "Position": position,
+            "Comment": comment,
+        })
+        parsed = post("employee", data, "Employee")
+        return format_single(parsed, response_format.value)
 
-        Use this tool when hiring a new employee who needs to be tracked in
-        the accounting system.
-        """
-        try:
-            if email and not _EMAIL_RE.match(email):
-                return f"Error: Invalid email address '{email}'."
-            data: dict = {"Name": name}
-            if email:    data["Email"] = email
-            if phone:    data["Phone"] = phone
-            if position: data["Position"] = position
-            if comment:  data["Comment"] = comment
-            return format_response(post("employee", data, "Employee"))
-        except Exception as e:
-            raise
-
-    @mcp.tool()
-    def list_employee_groups() -> str:
-        """
-        List all employee groups (departments/categories) in PayTraq.
-
-        Use this tool to get group IDs when organizing employees into
-        departments or teams.
-        """
-        try:
-            return format_response(get("employeeGroups"))
-        except Exception as e:
-            raise
+    @mcp.tool(
+        name="paytraq_list_employee_groups",
+        title="List employee groups",
+        annotations=READ_ONLY,
+    )
+    def paytraq_list_employee_groups(
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
+    ) -> str:
+        """List configured employee groups / departments."""
+        parsed = get("employeeGroups")
+        result = parse_list(parsed, page=0)
+        return format_list(result, response_format.value)

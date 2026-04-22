@@ -1,130 +1,147 @@
 """
-PayTraq MCP — Accounting Tools
----------------------------------
-Tools for accessing the chart of accounts, tax keys, and journal entries.
+PayTraq MCP — Accounting tools.
 
-When to use these tools:
-  - list_accounts / get_account: look up account codes and IDs for reporting
-    or when manually creating journal entries
-  - list_tax_keys: find the correct VAT/tax code before creating products
-    or services
-  - list_journals: review journal entries for a period (useful for audits
-    and reconciliation)
+Read-only lookups for the chart of accounts, tax keys, and journal entries.
+These are the building blocks for financial reporting and manual postings.
 """
 
-import re
+from __future__ import annotations
+
 from typing import Annotated, Optional
-from pydantic import Field
+
 from mcp.server.fastmcp import FastMCP
-from paytraq_client import get, format_response
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
-_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+from paytraq_client import format_list, format_single, get, parse_list
+from tools._common import ResponseFormat, ensure_date
 
 
-def _validate_date(value: Optional[str], field_name: str) -> Optional[str]:
-    if value and not _DATE_RE.match(value):
-        return f"Invalid {field_name} format '{value}'. Use YYYY-MM-DD (e.g. 2026-01-01)."
-    return None
+READ_ONLY = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+)
 
 
 def register(mcp: FastMCP) -> None:
 
-    # ── CHART OF ACCOUNTS ─────────────────────────────────────────────────────
-
-    @mcp.tool()
-    def list_accounts(
+    @mcp.tool(
+        name="paytraq_list_accounts",
+        title="List chart-of-accounts entries",
+        annotations=READ_ONLY,
+    )
+    def paytraq_list_accounts(
         query: Annotated[Optional[str], Field(
-            default=None,
-            description="Search by account name or account number/code.",
-        )] = None,
-    ) -> str:
-        """
-        List all accounts in the PayTraq chart of accounts (COA).
-
-        Use this tool when you need to:
-        - Find account IDs or codes for financial reports
-        - Look up which account number corresponds to a P&L or balance sheet line
-        - Verify account names and types before creating journal entries
-        """
-        try:
-            params: dict = {}
-            if query:
-                params["query"] = query
-            return format_response(get("accounts", params if params else None))
-        except Exception as e:
-            raise
-
-    @mcp.tool()
-    def get_account(
-        account_id: Annotated[int, Field(
-            description="Numeric PayTraq account ID from the chart of accounts.",
-            gt=0,
-        )],
-    ) -> str:
-        """
-        Get details of a specific account from the chart of accounts.
-
-        Use this tool when you need the full definition of an account (name,
-        code, type DR/CR, group) before using it in a report or journal entry.
-        """
-        try:
-            return format_response(get(f"account/{account_id}"))
-        except Exception as e:
-            raise
-
-    # ── TAX KEYS ──────────────────────────────────────────────────────────────
-
-    @mcp.tool()
-    def list_tax_keys() -> str:
-        """
-        List all tax keys (VAT rates and other tax codes) configured in PayTraq.
-
-        Use this tool before creating products, services, or documents when
-        you need to select the correct tax/VAT rate code (e.g. standard 21%,
-        reduced 12%, zero-rated, exempt).
-        """
-        try:
-            return format_response(get("taxkeys"))
-        except Exception as e:
-            raise
-
-    # ── JOURNALS ──────────────────────────────────────────────────────────────
-
-    @mcp.tool()
-    def list_journals(
-        date_from: Annotated[Optional[str], Field(
-            default=None,
-            description="Start date for journal entries in YYYY-MM-DD format.",
-        )] = None,
-        date_till: Annotated[Optional[str], Field(
-            default=None,
-            description="End date for journal entries in YYYY-MM-DD format.",
+            description="Optional search by account name or code (e.g. '6110', 'Revenue').",
         )] = None,
         page: Annotated[int, Field(
-            default=0,
             ge=0,
-            description="Page number for pagination (100 records per page).",
+            description="0-indexed page number (100 records per page).",
         )] = 0,
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' for structured data (default) or 'markdown' for human-readable.",
+        )] = ResponseFormat.JSON,
     ) -> str:
         """
-        List journal entries (double-entry bookkeeping records) for a period.
+        List accounts in the PayTraq chart of accounts (COA).
 
-        Use this tool when you need to:
-        - Audit accounting entries for a specific date range
-        - Reconcile posted transactions with source documents
-        - Review debit/credit postings before generating financial reports
-        Note: The profit_and_loss and balance_sheet report tools call this
-        internally — use this tool only when you need the raw journal data.
+        Use this to:
+          - Find account IDs or codes for journal entries and reporting.
+          - Look up which account number corresponds to a P&L / balance-sheet line.
+          - Verify account names and DR/CR types before posting.
+
+        Returns a paginated list with has_more / next_page metadata.
         """
-        try:
-            for val, name in [(date_from, "date_from"), (date_till, "date_till")]:
-                err = _validate_date(val, name)
-                if err:
-                    return f"Error: {err}"
+        params: dict = {"page": page}
+        if query:
+            params["query"] = query
+        parsed = get("accounts", params)
+        result = parse_list(parsed, page=page)
+        return format_list(result, response_format.value)
 
-            params: dict = {"page": page}
-            if date_from: params["date_from"] = date_from
-            if date_till: params["date_till"] = date_till
-            return format_response(get("journals", params))
-        except Exception as e:
-            raise
+    @mcp.tool(
+        name="paytraq_get_account",
+        title="Get a single chart-of-accounts entry",
+        annotations=READ_ONLY,
+    )
+    def paytraq_get_account(
+        account_id: Annotated[int, Field(
+            gt=0,
+            description="Numeric PayTraq account ID (from paytraq_list_accounts).",
+        )],
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
+    ) -> str:
+        """
+        Return the full definition of one account (name, code, DR/CR type, group).
+
+        Use before generating a journal entry or when you need to understand an
+        account referenced in a report line.
+        """
+        parsed = get(f"account/{account_id}")
+        return format_single(parsed, response_format.value)
+
+    @mcp.tool(
+        name="paytraq_list_tax_keys",
+        title="List VAT / tax keys",
+        annotations=READ_ONLY,
+    )
+    def paytraq_list_tax_keys(
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
+    ) -> str:
+        """
+        List every configured tax key (VAT rates, reverse-charge, zero-rated, exempt).
+
+        Call this first whenever you're about to create a product, service, or
+        document — the PayTraq API requires a valid TaxKeyID.
+        """
+        # NOTE: endpoint is camelCase taxKeys — lowercase 'taxkeys' 404s.
+        parsed = get("taxKeys")
+        result = parse_list(parsed, page=0)
+        return format_list(result, response_format.value)
+
+    @mcp.tool(
+        name="paytraq_list_journals",
+        title="List general-ledger journal entries",
+        annotations=READ_ONLY,
+    )
+    def paytraq_list_journals(
+        date_from: Annotated[Optional[str], Field(
+            description="Start date (YYYY-MM-DD). Omit to accept the PayTraq default (current year).",
+        )] = None,
+        date_till: Annotated[Optional[str], Field(
+            description="End date (YYYY-MM-DD) inclusive.",
+        )] = None,
+        page: Annotated[int, Field(
+            ge=0,
+            description="0-indexed page number (100 records per page).",
+        )] = 0,
+        response_format: Annotated[ResponseFormat, Field(
+            description="'json' or 'markdown'.",
+        )] = ResponseFormat.JSON,
+    ) -> str:
+        """
+        List posted journal entries (double-entry bookkeeping records) for a period.
+
+        Use this to:
+          - Audit accounting entries for a date range.
+          - Reconcile posted transactions with their source documents.
+          - Extract raw DR/CR data when paytraq_profit_and_loss or
+            paytraq_balance_sheet doesn't give you the level of detail you need.
+        """
+        ensure_date(date_from, "date_from")
+        ensure_date(date_till, "date_till")
+
+        params: dict = {"page": page}
+        if date_from:
+            params["date_from"] = date_from
+        if date_till:
+            params["date_till"] = date_till
+        parsed = get("journals", params)
+        result = parse_list(parsed, page=page)
+        return format_list(result, response_format.value)

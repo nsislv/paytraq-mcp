@@ -1,71 +1,90 @@
 """
 PayTraq MCP Server
 ------------------
-MCP server for integrating with PayTraq — a cloud-based accounting and ERP system.
+Model Context Protocol server for the PayTraq cloud ERP / accounting system.
 
-Covers the full API v2.57:
-  • Clients, suppliers, employees
-  • Sales and purchase documents, payments
-  • Products, services, warehouse, inventory
-  • Accounting, taxes, journals, financial reports
+Capabilities:
+  - Clients, suppliers, employees (CRUD + contacts / banks / groups)
+  - Sales & purchase document lifecycle (create → approve → post → pay / void)
+  - Payments, attachments, PDFs
+  - Products, services, warehouses, inventory, lots, shippers
+  - Chart of accounts, tax keys, journals
+  - Financial reports (P&L, balance sheet, quarterly)
 
-Requirements:
-  PAYTRAQ_API_TOKEN — token from PayTraq settings
-  PAYTRAQ_API_KEY   — API key from PayTraq settings
+Required environment variables:
+  PAYTRAQ_API_TOKEN  — token issued in PayTraq → Settings → API
+  PAYTRAQ_API_KEY    — API key issued in PayTraq → Settings → API
 
-Usage:
+Usage (stdio transport for MCP clients like Claude Desktop):
   PAYTRAQ_API_TOKEN=xxx PAYTRAQ_API_KEY=yyy python server.py
 
-Rate limits (enforced automatically):
-  1 req/sec avg | burst 5 | 5000 requests/day
+PayTraq rate limits (enforced client-side automatically):
+  1 req/sec avg, burst of 5, 5000 req/day. The server throttles and retries
+  on 429 / 5xx; long reports may take time because of this.
 """
 
+from __future__ import annotations
+
+import atexit
 import os
 import sys
+
 from mcp.server.fastmcp import FastMCP
 
-# ── Environment variable check ────────────────────────────────────────────────
+import paytraq_client
+from tools import accounting, clients, documents, products, reports
 
-_TOKEN = os.getenv("PAYTRAQ_API_TOKEN", "")
-_KEY   = os.getenv("PAYTRAQ_API_KEY", "")
 
-if not _TOKEN or not _KEY:
-    print(
-        "❌ ERROR: Set PAYTRAQ_API_TOKEN and PAYTRAQ_API_KEY environment variables.\n"
-        "  Example:\n"
-        "    export PAYTRAQ_API_TOKEN=your_token\n"
-        "    export PAYTRAQ_API_KEY=your_key\n",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-# ── MCP initialisation ────────────────────────────────────────────────────────
-
-mcp = FastMCP(
-    "PayTraq",
-    instructions=(
-        "You are connected to PayTraq — a cloud-based accounting and ERP system. "
-        "You can manage clients, suppliers, employees, products, services, "
-        "sales invoices, purchase orders, payments, inventory, and accounting records. "
-        "All monetary values use dot as decimal separator (e.g. 10.90). "
-        "Dates must be in YYYY-MM-DD format. "
-        "Country codes are 2-letter ISO (LV, EE, LT, DE...). "
-        "Currency codes follow ISO 4217 (EUR, USD, GBP...). "
-        "The API is rate-limited to 1 req/sec on average — responses may take a moment."
-    ),
+INSTRUCTIONS = (
+    "You are connected to PayTraq, a cloud accounting & ERP system. "
+    "Capabilities: clients/suppliers/employees, sales & purchase documents "
+    "(draft → approved → posted → paid/voided), payments, products/services, "
+    "warehouses & inventory, chart of accounts, tax keys, journals, and P&L / "
+    "balance-sheet reports.\n\n"
+    "Conventions:\n"
+    "- Every tool name is prefixed 'paytraq_' to avoid collisions with other MCP servers.\n"
+    "- Dates use YYYY-MM-DD. Decimals use a dot (10.90). Country codes are ISO "
+    "  3166-1 alpha-2 (LV, EE, DE). Currency codes are ISO 4217 (EUR, USD).\n"
+    "- List tools support pagination (page=0,1,...) and return has_more / "
+    "  next_page. 100 records per page.\n"
+    "- All tools accept response_format='json' (default) or 'markdown'.\n"
+    "- Read-only tools are hinted as such via MCP annotations; destructive "
+    "  actions (void_sale) are hinted destructive.\n"
+    "- The API is throttled to ~1 req/sec — expect short waits on large queries."
 )
 
-# ── Tool registration ─────────────────────────────────────────────────────────
 
-from tools import clients, documents, products, accounting, reports
+def _require_env() -> None:
+    token = os.environ.get("PAYTRAQ_API_TOKEN", "").strip()
+    key = os.environ.get("PAYTRAQ_API_KEY", "").strip()
+    if not token or not key:
+        print(
+            "ERROR: PAYTRAQ_API_TOKEN and PAYTRAQ_API_KEY environment variables are required.\n"
+            "  Find them in PayTraq -> Settings -> API and set them before starting.\n"
+            "  Example:\n"
+            "    PAYTRAQ_API_TOKEN=xxx PAYTRAQ_API_KEY=yyy python server.py",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
-clients.register(mcp)
-documents.register(mcp)
-products.register(mcp)
-accounting.register(mcp)
-reports.register(mcp)
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+def build_server() -> FastMCP:
+    """Construct and wire up the FastMCP server."""
+    mcp = FastMCP("paytraq-mcp", instructions=INSTRUCTIONS)
+    accounting.register(mcp)
+    clients.register(mcp)
+    documents.register(mcp)
+    products.register(mcp)
+    reports.register(mcp)
+    return mcp
+
+
+def main() -> None:
+    _require_env()
+    atexit.register(paytraq_client.close)
+    server = build_server()
+    server.run()
+
 
 if __name__ == "__main__":
-    mcp.run()
+    main()
