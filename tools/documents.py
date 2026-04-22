@@ -34,11 +34,34 @@ from tools._common import (
     ensure_in,
 )
 
-VALID_STATUSES: set[str] = {"draft", "approved", "posted", "paid", "voided"}
+VALID_STATUSES: set[str] = {
+    "draft", "approved", "posted", "paid", "wait_payment", "voided",
+}
 VALID_SALE_TYPES: set[str] = {
     "sales_invoice", "sales_order", "sales_proforma", "sales_receipt", "credit_note",
 }
 VALID_OPERATIONS: set[str] = {"sell_goods", "sell_services", "other_income"}
+
+
+def _amount_due(item: Any) -> float:
+    """
+    Extract AmountDue from a list item's Header block as a float. Returns 0.0
+    when the field is missing, empty, or unparseable — an unreadable balance
+    is treated as zero so _is_unpaid() stays conservative.
+    """
+    if not isinstance(item, dict):
+        return 0.0
+    header = item.get("Header") if isinstance(item.get("Header"), dict) else item
+    raw = header.get("AmountDue", "0") if isinstance(header, dict) else "0"
+    try:
+        return float(raw or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _is_unpaid(item: Any) -> bool:
+    """True if the document has an outstanding balance (AmountDue > 0)."""
+    return _amount_due(item) > 0
 
 
 READ_ONLY = ToolAnnotations(
@@ -96,7 +119,13 @@ def register(mcp: FastMCP) -> None:
     )
     def paytraq_list_sales(
         status: Annotated[Optional[str], Field(
-            description=f"Filter by status. One of: {', '.join(sorted(VALID_STATUSES))}.",
+            description=(
+                "Filter by status. One of: "
+                f"{', '.join(sorted(VALID_STATUSES))}. "
+                "Note: PayTraq's status filter is imprecise for outstanding "
+                "balances — prefer `unpaid_only=True` to find invoices that "
+                "still owe money regardless of status."
+            ),
         )] = None,
         date_from: Annotated[Optional[str], Field(
             description="Document date lower bound (YYYY-MM-DD).",
@@ -110,9 +139,21 @@ def register(mcp: FastMCP) -> None:
         query: Annotated[Optional[str], Field(
             description="Text search by document number or reference.",
         )] = None,
+        unpaid_only: Annotated[bool, Field(
+            description=(
+                "If True, keep only documents with AmountDue > 0 (reliable "
+                "'unpaid' filter that works regardless of DocumentStatus). "
+                "Applied client-side after the PayTraq query, so combine with "
+                "date_from/date_till to avoid paging through many paid docs."
+            ),
+        )] = False,
         page: Annotated[int, Field(ge=0, description="0-indexed page (100/page).")] = 0,
         reverse: Annotated[bool, Field(
-            description="True = newest-first ordering.",
+            description=(
+                "False (default) = newest-first ordering. True = reverse to "
+                "oldest-first. NB: PayTraq's natural order is descending by "
+                "DocumentDate, so `reverse=True` flips it to ascending."
+            ),
         )] = False,
         response_format: Annotated[ResponseFormat, Field(
             description="'json' or 'markdown'.",
@@ -122,9 +163,14 @@ def register(mcp: FastMCP) -> None:
         List sales documents (invoices, orders, receipts, proformas, credit notes).
 
         Common filters:
-          - status='approved' or 'posted' → outstanding invoices
+          - unpaid_only=True → only documents with outstanding balance
           - client_id=N → all documents for one customer
           - date_from / date_till → period-based reporting
+
+        Tip: the response is capped at ~25 000 chars. If you see a
+        "response shrunk from N to M items" note, narrow the date range or
+        add a filter — do NOT assume the unseen items are absent, they were
+        simply trimmed from the page payload.
         """
         ensure_in(status, VALID_STATUSES, "status")
         ensure_date(date_from, "date_from")
@@ -138,7 +184,11 @@ def register(mcp: FastMCP) -> None:
         if query:     params["query"] = query
         if reverse:   params["reverse"] = "true"
         parsed = get("sales", params)
-        return format_list(parse_list(parsed, page=page), response_format.value)
+        result = parse_list(parsed, page=page)
+        if unpaid_only:
+            result.items = [it for it in result.items if _is_unpaid(it)]
+            result.count = len(result.items)
+        return format_list(result, response_format.value)
 
     @mcp.tool(
         name="paytraq_get_sale",
@@ -385,16 +435,33 @@ def register(mcp: FastMCP) -> None:
     )
     def paytraq_list_purchases(
         status: Annotated[Optional[str], Field(
-            description=f"Filter by status. One of: {', '.join(sorted(VALID_STATUSES))}.",
+            description=(
+                "Filter by status. One of: "
+                f"{', '.join(sorted(VALID_STATUSES))}. "
+                "Note: PayTraq's status filter is imprecise for outstanding "
+                "balances — prefer `unpaid_only=True` to find bills that "
+                "still owe money regardless of status."
+            ),
         )] = None,
         date_from: Annotated[Optional[str], Field(description="Start date (YYYY-MM-DD).")] = None,
         date_till: Annotated[Optional[str], Field(description="End date (YYYY-MM-DD).")] = None,
         supplier_id: Annotated[Optional[int], Field(
             gt=0, description="Filter to one SupplierID.",
         )] = None,
+        unpaid_only: Annotated[bool, Field(
+            description=(
+                "If True, keep only purchases with AmountDue > 0 (reliable "
+                "'unpaid' filter regardless of DocumentStatus). Applied "
+                "client-side; combine with a date range for efficiency."
+            ),
+        )] = False,
         page: Annotated[int, Field(ge=0, description="0-indexed page (100/page).")] = 0,
         reverse: Annotated[bool, Field(
-            description="True = newest-first ordering.",
+            description=(
+                "False (default) = newest-first ordering. True = reverse to "
+                "oldest-first. NB: PayTraq's natural order is descending by "
+                "DocumentDate, so `reverse=True` flips it to ascending."
+            ),
         )] = False,
         response_format: Annotated[ResponseFormat, Field(
             description="'json' or 'markdown'.",
@@ -404,9 +471,13 @@ def register(mcp: FastMCP) -> None:
         List purchase documents (vendor invoices, POs).
 
         Typical uses:
-          - status='approved'/'posted' and not paid → outstanding AP
+          - unpaid_only=True → outstanding accounts payable
           - supplier_id=N → full purchase history from one vendor
           - date range → reconcile invoices for a period
+
+        Tip: the response is capped at ~25 000 chars. If you see a
+        "response shrunk from N to M items" note, narrow the date range or
+        add a filter — the trimmed items still exist, they just didn't fit.
         """
         ensure_in(status, VALID_STATUSES, "status")
         ensure_date(date_from, "date_from")
@@ -419,7 +490,11 @@ def register(mcp: FastMCP) -> None:
         if supplier_id: params["supplier_id"] = supplier_id
         if reverse:     params["reverse"] = "true"
         parsed = get("purchases", params)
-        return format_list(parse_list(parsed, page=page), response_format.value)
+        result = parse_list(parsed, page=page)
+        if unpaid_only:
+            result.items = [it for it in result.items if _is_unpaid(it)]
+            result.count = len(result.items)
+        return format_list(result, response_format.value)
 
     @mcp.tool(
         name="paytraq_get_purchase",

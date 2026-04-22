@@ -168,7 +168,7 @@ annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
 
 | Tool | Read-only | Description |
 |------|:---------:|-------------|
-| `paytraq_list_sales` | ✓ | List sales documents (status / date / client filters) |
+| `paytraq_list_sales` | ✓ | List sales documents (status / date / client filters, `unpaid_only`) |
 | `paytraq_get_sale` | ✓ | Full invoice/order details |
 | `paytraq_create_sale` |   | Create a sales document |
 | `paytraq_approve_sale` |   | Move draft → approved |
@@ -177,7 +177,7 @@ annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
 | `paytraq_record_sale_payment` |   | Record a customer payment |
 | `paytraq_send_sale` |   | Email the document to the client |
 | `paytraq_get_sale_pdf` | ✓ | Get PDF download data |
-| `paytraq_list_purchases` | ✓ | List purchase documents |
+| `paytraq_list_purchases` | ✓ | List purchase documents (status / date / supplier filters, `unpaid_only`) |
 | `paytraq_get_purchase` | ✓ | Full purchase document details |
 | `paytraq_create_purchase` |   | Create a purchase document |
 | `paytraq_approve_purchase` |   | Move draft → approved |
@@ -190,7 +190,17 @@ annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
 **Sales document types (`sale_type`):**
 `sales_invoice`, `sales_order`, `sales_proforma`, `sales_receipt`, `credit_note`
 
-**Statuses (`status`):** `draft`, `approved`, `posted`, `paid`, `voided`
+**Statuses (`status`):** `draft`, `approved`, `posted`, `wait_payment`, `paid`, `voided`
+
+> PayTraq's `status` filter is imprecise for finding outstanding balances —
+> it can return fully-paid documents and miss genuinely unpaid ones. For a
+> reliable "show me everything that still owes money" query use the
+> **`unpaid_only=True`** flag on `paytraq_list_sales` / `paytraq_list_purchases`
+> instead. It filters client-side on `AmountDue > 0`, which always matches
+> the actual receivable/payable balance.
+
+**Ordering (`reverse`):** PayTraq's natural order is **newest-first**
+(descending by DocumentDate). Set `reverse=True` to flip to oldest-first.
 
 **Line items** are passed as a list of dicts:
 
@@ -282,6 +292,25 @@ List tools return a pagination block:
 
 PayTraq does not expose a `total_count`, so `has_more` is inferred from page
 fullness (100 records/page). Pass `page=1`, `page=2`, ... to walk pages.
+
+### Response size limit
+
+All responses are capped at **25 000 characters** to stay within MCP client
+context budgets. When a list page is too large, items are dropped from the
+tail of the payload (not the API) and a `truncated_to: N` note is added to
+`pagination`, plus a trailing message:
+
+```
+[response shrunk from 100 to 12 items to fit 25000-char limit
+ — request a narrower filter or call again with page=1]
+```
+
+**Important:** the trimmed items still exist in PayTraq — they were only
+removed from this page's payload. To see them, either:
+
+- narrow the query (`date_from` / `date_till` / `client_id` / `unpaid_only`),
+  or
+- request the next page.
 
 ---
 
